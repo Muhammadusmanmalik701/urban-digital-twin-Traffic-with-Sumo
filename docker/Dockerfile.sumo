@@ -1,0 +1,15 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sumo sumo-tools sumo-doc python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install traci
+
+WORKDIR /simulations
+
+COPY simulations/ .
+
+EXPOSE 8813
+
+CMD ["python3", "-c", "import time; print('SUMO stub running — connect TraCI on port 8813'); time.sleep(86400)"]

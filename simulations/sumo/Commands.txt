@@ -1,0 +1,47 @@
+✅ Step 1: Check if file is correct
+🔍 Open map.osm and check:
+✔️ It should contain MANY of these:
+<node ...
+<way ...
+
+🚀 Step 2: Skip osmWebWizard (important)
+
+👉 Don’t use osmWebWizard.py anymore (it’s causing your issue)
+
+✅ Use direct SUMO pipeline
+
+Go to your folder:
+
+cd "C:\Users\WELCOME\Desktop\Git proj\Cesium-Sumo-digital-twin-road-network\sumo_files"
+
+🔧 1. Convert OSM → network
+
+netconvert --osm-files map.osm -o map.net.xml
+
+🚗 2. Generate trips
+
+python "C:\Program Files (x86)\Eclipse\Sumo\tools\randomTrips.py" -n map.net.xml -o trips.trips.xml
+
+🔁 3. Generate routes
+duarouter -n map.net.xml -t trips.trips.xml -o routes.rou.xml
+
+▶️ 4. Create config (simple) sim.sumocfg
+
+
+<configuration>
+    <input>
+        <net-file value="map.net.xml"/>
+        <route-files value="routes.rou.xml"/>
+    </input>
+
+    <output>
+        <fcd-output value="fcd.xml"/>
+        <fcd-output.geo value="true"/>
+    </output>
+</configuration>
+
+
+
+
+▶️ Run simulation
+sumo-gui sim.sumocfg

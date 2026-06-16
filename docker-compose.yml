@@ -1,0 +1,177 @@
+version: "3.9"
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_CESIUM_TOKEN=${VITE_CESIUM_TOKEN}
+      - VITE_API_URL=http://localhost:8000
+      - VITE_ML_URL=http://localhost:8001
+      - VITE_WS_URL=ws://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      timescale:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - TIMESCALE_URL=${TIMESCALE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - ML_SERVICE_URL=http://ml_service:8001
+      - SUMO_PORT=8813
+      - CORS_ORIGINS=http://localhost:3000
+    volumes:
+      - ./backend:/app
+
+  ml_service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ml
+    ports:
+      - "8001:8001"
+    depends_on:
+      timescale:
+        condition: service_healthy
+    environment:
+      - TIMESCALE_URL=${TIMESCALE_URL}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./ml_service:/app
+      - ml_models:/app/app/models
+
+  sumo:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sumo
+    ports:
+      - "8813:8813"
+    volumes:
+      - ./simulations/sumo:/simulations
+
+  postgres:
+    image: postgis/postgis:15-3.4
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: digital_twin
+      POSTGRES_USER: ${DB_USER:-user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/01_postgis_schema.sql:/docker-entrypoint-initdb.d/01.sql
+      - ./database/03_bim_schema.sql:/docker-entrypoint-initdb.d/03.sql
+      - ./database/04_scenario_schema.sql:/docker-entrypoint-initdb.d/04.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-user} -d digital_twin"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  timescale:
+    image: timescale/timescaledb-ha:pg15-latest
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: timeseries
+      POSTGRES_USER: ${DB_USER:-user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+    volumes:
+      - timescale_data:/home/postgres/pgdata/data
+      - ./database/02_timescale_schema.sql:/docker-entrypoint-initdb.d/01.sql
+      - ./database/05_ml_features_schema.sql:/docker-entrypoint-initdb.d/02.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-user} -d timeseries"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    command: celery -A app.core.celery_app worker -Q feature_pipeline,scenario_detection,energy_analysis --loglevel=info --concurrency=4
+    depends_on:
+      - redis
+      - timescale
+      - postgres
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - TIMESCALE_URL=${TIMESCALE_URL}
+      - REDIS_URL=${REDIS_URL}
+    volumes:
+      - ./backend:/app
+
+  celery_beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    command: celery -A app.core.celery_app beat --loglevel=info
+    depends_on:
+      - redis
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - TIMESCALE_URL=${TIMESCALE_URL}
+      - REDIS_URL=${REDIS_URL}
+    volumes:
+      - ./backend:/app
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow_data:/mlflow
+
+  jupyter:
+    image: jupyter/datascience-notebook:latest
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    volumes:
+      - ./ml_service/notebooks:/home/jovyan/work
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+      - ml_service
+
+volumes:
+  postgres_data:
+  timescale_data:
+  redis_data:
+  ml_models:
+  mlflow_data:
