@@ -292,9 +292,105 @@ The biggest gap: **Memory layer** (Timeline Slider) — transforms it from "dash
 
 ---
 
+---
+
+## 🚗 Session 3 — Live SUMO Simulation + Smooth Vehicles (June 16 2026)
+
+### What was built
+
+#### Live SUMO Streaming (ported from VC Model project)
+- **Source:** `C:\Users\UBordeaux\Desktop\VC Model\map-ui\sumo_files\sumo_live_server.py`
+- **Copied to:** `simulations/sumo/sumo_live_server.py`
+- **How it works:** Python WebSocket server (port 8765) watches `fcd.xml` as SUMO writes it in real-time. Browser sends `{"type":"start"}` → server launches `sumo-gui.exe` automatically → user presses ▶ Play in SUMO-GUI → vehicles stream to browser map.
+- **No TraCI** — pure file-watching approach, no version mismatch issues.
+
+#### Frontend Live Connection (`CesiumViewer.tsx`)
+- `connectLive()` — connects to `ws://localhost:8765`, sends `{"type":"start"}` on open (triggers auto-launch of SUMO-GUI)
+- `disconnectLive()` — sends stop, clears entities, resets epoch
+- `liveState` — `'idle' | 'connecting' | 'waiting' | 'running' | 'error' | 'stopped'`
+- Live status bar (top-right): pulsing red dot when running, shows vehicle count + sim time
+- "Live SUMO" button (appears when idle, not loaded)
+
+#### Ferrari 3D Car Model
+- Downloaded from Three.js samples (`ferrari.glb`, 1.6 MB, Draco compressed)
+- Saved to `frontend/public/sumo/ferrari.glb`
+- Replaces generic CesiumMilkTruck for live vehicles
+- Scale: `1.0` (real-world size)
+
+### Bugs Fixed This Session
+
+#### Bug 8: SUMO angle → Cesium heading wrong direction
+- **Problem:** Cars moving but facing sideways/wrong direction on roads
+- **Root cause:** SUMO angle = clockwise from North. Cesium heading = clockwise from East in local ENU frame. Reference axis differs by 90°.
+- **Fix iterations:**
+  1. Changed `angleDeg` → `angleDeg - 90` (cars still reversed)
+  2. Changed to `angleDeg + 90` ✅ correct
+- **Final formula:** `CesiumMath.toRadians(angleDeg + 90.0)`
+
+#### Bug 9: Cars too large (passing through each other visually)
+- **Problem:** `scale: 2.5` made Ferrari ~11m long (2.5× real size), cars overlapped on screen
+- **Fix:** `scale: 1.0` → real-world size (~4.5m)
+
+#### Bug 10: Jumpy/teleporting vehicle movement
+- **Problem:** Each WebSocket frame set `ConstantPositionProperty` → instant position jump
+- **Fix:** `SampledPositionProperty` + `VelocityOrientationProperty`
+  - Cesium interpolates linearly between position samples
+  - `VelocityOrientationProperty` derives heading from movement direction automatically (no manual angle needed for smooth turns)
+  - Cesium clock advanced 1 step ahead so interpolated position is always in range
+  - `ExtrapolationType.HOLD` — holds last position when no new data
+
+### Key Code Patterns
+
+#### Smooth vehicle interpolation
+```typescript
+// Create once per vehicle
+const sampledPos = new SampledPositionProperty()
+sampledPos.setInterpolationOptions({
+  interpolationAlgorithm: LinearApproximation,
+  interpolationDegree: 1,
+})
+sampledPos.forwardExtrapolationType = ExtrapolationType.HOLD
+
+entity = viewer.entities.add({
+  position: sampledPos,
+  orientation: new VelocityOrientationProperty(sampledPos), // auto heading!
+  model: { uri: '/sumo/ferrari.glb', scale: 1.0, ... }
+})
+
+// Each WebSocket frame — just add sample, Cesium handles the rest
+const jt = JulianDate.addSeconds(liveEpoch, simTime, new JulianDate())
+sampledPos.addSample(jt, Cartesian3.fromDegrees(lon, lat, 0))
+viewer.clock.currentTime = JulianDate.addSeconds(jt, 1.0, new JulianDate())
+```
+
+#### Startup flow (3 terminals)
+```
+Terminal 1: cd simulations/sumo && python sumo_live_server.py
+Terminal 2: cd frontend && npm run dev
+Browser:    Click "Live SUMO" → SUMO-GUI auto-opens → press ▶ Play
+```
+
+### New Imports Added
+```typescript
+import {
+  SampledPositionProperty,
+  LinearApproximation,
+  ExtrapolationType,
+} from 'cesium'
+```
+
+### GitHub Backup
+- Repository: https://github.com/Muhammadusmanmalik701/urban-digital-twin-Traffic-with-Sumo
+- First commit: `7aef05d` — 101 files, full project backup
+- Git config: `user.email = imsintern26@gmail.com`, `user.name = UBordeaux`
+- Future commits: `git add . && git commit -m "message" && git push`
+
+---
+
 ## 📚 Reference
 
 - **Original Bordeaux index.html repo:** https://github.com/Muhammadusmanmalik701/Cesium-Sumo-digital-twin-road-network
+- **GitHub backup:** https://github.com/Muhammadusmanmalik701/urban-digital-twin-Traffic-with-Sumo
 - **Bordeaux Open Data:** https://opendata.bordeaux-metropole.fr
 - **Cesium Ion dashboard:** https://ion.cesium.com
 - **Overpass API:** https://overpass-api.de
