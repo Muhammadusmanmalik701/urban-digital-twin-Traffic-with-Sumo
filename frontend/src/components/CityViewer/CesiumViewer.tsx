@@ -237,6 +237,7 @@ export function CesiumViewer() {
   const preRenderListenerRef = useRef<any>(null)
   const startFollowRef      = useRef<(entity: any, mode: 'top' | 'front') => void>()
   const lastCarPosRef       = useRef<any>(null)
+  const egoFollowedRef      = useRef(false)
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -247,6 +248,7 @@ export function CesiumViewer() {
   const [liveSimTime, setLiveSimTime] = useState(0)
   const [liveMsg, setLiveMsg]       = useState('')
   const [followInfo, setFollowInfo] = useState<{ active: boolean; mode: 'top' | 'front' }>({ active: false, mode: 'top' })
+  const [egoActive, setEgoActive]   = useState(false)
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
@@ -962,6 +964,7 @@ export function CesiumViewer() {
             sampledPos.forwardExtrapolationType = ExtrapolationType.HOLD
             sampledPos.backwardExtrapolationType = ExtrapolationType.HOLD
             sampledPos.addSample(jt, pos)
+            const isEgo = id === 'f_0.0'
             const vm = getVehicleModel(vtype)
             const e = v.entities.add({
               id: `live_${id}`,
@@ -969,19 +972,25 @@ export function CesiumViewer() {
               orientation: new ConstantProperty(orient),
               model: {
                 uri: vm.uri,
-                scale: vm.scale,
-                minimumPixelSize: 10,
+                scale: isEgo ? vm.scale * 1.3 : vm.scale,
+                minimumPixelSize: isEgo ? 16 : 10,
                 maximumScale: vm.maxScale,
                 heightReference: HeightReference.CLAMP_TO_GROUND,
-                ...(vm.color ? {
-                  color: vm.color,
-                  colorBlendMode: ColorBlendMode.MIX,
-                  colorBlendAmount: 0.45,
-                } : {}),
+                color: isEgo
+                  ? Color.fromCssColorString('#fbbf24')   // gold for ego car
+                  : (vm.color ?? Color.WHITE),
+                colorBlendMode: ColorBlendMode.MIX,
+                colorBlendAmount: isEgo ? 0.75 : (vm.color ? 0.45 : 0),
               },
             })
             vehicleAngleMap.set(e, angle)
             liveEntities.current.set(id, e)
+            // Auto-follow ego car when it first appears
+            if (isEgo && !egoFollowedRef.current) {
+              egoFollowedRef.current = true
+              setEgoActive(true)
+              startFollowRef.current?.(e, 'top')
+            }
           }
         })
 
@@ -989,6 +998,11 @@ export function CesiumViewer() {
           if (!activeIds.has(id)) {
             v.entities.remove(e)
             liveEntities.current.delete(id)
+            if (id === 'f_0.0') {
+              egoFollowedRef.current = false
+              setEgoActive(false)
+              stopFollow()
+            }
           }
         })
       }
@@ -1011,6 +1025,9 @@ export function CesiumViewer() {
     liveEntities.current.forEach((e) => cesiumViewer.current?.entities.remove(e))
     liveEntities.current.clear()
     liveEpoch.current = null
+    egoFollowedRef.current = false
+    setEgoActive(false)
+    stopFollow()
     setLiveState('idle')
     setLiveCount(0)
     setLiveSimTime(0)
@@ -1173,10 +1190,20 @@ export function CesiumViewer() {
         </button>
       )}
 
+      {/* ── Ego car badge ── */}
+      {egoActive && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-amber-500/20 backdrop-blur-xl border border-amber-400/50 rounded-2xl px-4 py-2 shadow-2xl">
+          <span className="text-amber-300 text-xs font-bold tracking-wide">🚗 EGO CAR ACTIVE</span>
+          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+        </div>
+      )}
+
       {/* ── Car follow camera UI ── */}
       {followInfo.active && (
         <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-gray-950/95 backdrop-blur-xl border border-white/15 rounded-2xl px-4 py-2.5 shadow-2xl">
-          <span className="text-amber-400 text-xs font-semibold mr-1">🎯 Following car</span>
+          <span className={`text-xs font-semibold mr-1 ${egoActive ? 'text-amber-400' : 'text-sky-400'}`}>
+            {egoActive ? '🚗 Ego Car' : '🎯 Following car'}
+          </span>
           <button
             onClick={() => startFollowRef.current?.(followEntityRef.current, 'top')}
             className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
