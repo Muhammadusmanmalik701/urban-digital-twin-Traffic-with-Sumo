@@ -299,16 +299,16 @@ export function CesiumViewer() {
       if (followModeRef.current === 'top') {
         // Bird's eye: directly above, straight down — car perfectly centered
         v.camera.setView({
-          destination: Cartesian3.fromDegrees(lon, lat, alt + 70),
+          destination: Cartesian3.fromDegrees(lon, lat, alt + 250),
           orientation: { heading, pitch: CesiumMath.toRadians(-90), roll: 0 },
         })
       } else {
-        // Follow/front: 25m behind car, 12m above — car centered, road ahead visible
-        const behindDist = 0.00025  // ~25m in degrees
+        // Follow/front: 100m behind car, 50m above
+        const behindDist = 0.00090  // ~100m in degrees
         const behindLon = lon - Math.sin(CesiumMath.toRadians(angleDeg)) * behindDist
         const behindLat = lat - Math.cos(CesiumMath.toRadians(angleDeg)) * behindDist
         v.camera.setView({
-          destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 12),
+          destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 50),
           orientation: { heading, pitch: CesiumMath.toRadians(-22), roll: 0 },
         })
       }
