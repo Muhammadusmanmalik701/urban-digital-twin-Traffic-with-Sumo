@@ -197,18 +197,76 @@ function sumoAngleToOrientation(lon: number, lat: number, angleDeg: number) {
   return Transforms.headingPitchRollQuaternion(pos, hpr)
 }
 
-interface VehicleModel { uri: string; scale: number; maxScale: number; color?: any }
-function getVehicleModel(vtype: string): VehicleModel {
+interface VehicleModel { uri: string; scale: number; maxScale: number; color?: any; blendAmount?: number }
+
+// Hash vehicle ID → stable integer (same vehicle always same appearance)
+function idHash(id: string): number {
+  let h = 2166136261
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i)
+    h = (h * 16777619) >>> 0
+  }
+  return h
+}
+
+// 16 visually distinct passenger-vehicle configs across 4 shapes
+const PASSENGER_CONFIGS: { uri: string; scale: number; maxScale: number; hex: string; blend: number }[] = [
+  // ── Mini cars (small scale, bright) ──────────────────────────────────────
+  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#ef4444', blend: 0.60 }, // red mini
+  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#f97316', blend: 0.60 }, // orange mini
+  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#eab308', blend: 0.60 }, // yellow mini
+  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#22c55e', blend: 0.60 }, // green mini
+
+  // ── Sedan  (Toyota / Honda / Tesla) ──────────────────────────────────────
+  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#f8fafc', blend: 0.65 }, // pearl white
+  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#94a3b8', blend: 0.55 }, // silver
+  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#0f172a', blend: 0.70 }, // midnight black
+  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#1d4ed8', blend: 0.60 }, // navy blue
+
+  // ── SUV / 4×4 (Chinese, Land Rover class) ────────────────────────────────
+  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#1e293b', blend: 0.65 }, // dark 4x4
+  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#7f1d1d', blend: 0.60 }, // dark red 4x4
+  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#14532d', blend: 0.60 }, // forest green 4x4
+  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#d4d4d4', blend: 0.55 }, // silver SUV
+
+  // ── Van / MPV ─────────────────────────────────────────────────────────────
+  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#e2e8f0', blend: 0.55 }, // white van
+  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#fbbf24', blend: 0.60 }, // yellow van
+  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#6366f1', blend: 0.60 }, // purple van
+  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#0ea5e9', blend: 0.55 }, // sky blue van
+]
+
+function getVehicleModel(vtype: string, vehicleId: string): VehicleModel {
   const t = (vtype || '').toLowerCase()
-  if (t.includes('bus') || t.includes('coach'))
-    return { uri: '/sumo/truck.glb', scale: 2.2, maxScale: 45,
-             color: Color.fromCssColorString('#34d399') }   // green bus
-  if (t.includes('truck') || t.includes('trailer') || t.includes('heavy') || t.includes('delivery'))
-    return { uri: '/sumo/truck.glb', scale: 1.4, maxScale: 28 }  // milk-truck colour
-  if (t.includes('moto') || t.includes('bicycle') || t.includes('bike'))
-    return { uri: '/sumo/ferrari.glb', scale: 0.55, maxScale: 11,
-             color: Color.fromCssColorString('#fbbf24') }   // yellow moped
-  return { uri: '/sumo/ferrari.glb', scale: 1.0, maxScale: 20 }  // red passenger car
+
+  // Ego car — stays gold (handled at call site, but guard here too)
+  if (vehicleId === 'f_0.0')
+    return { uri: '/sumo/ferrari.glb', scale: 1.0, maxScale: 20, color: Color.fromCssColorString('#fbbf24'), blendAmount: 0.75 }
+
+  // Bus / coach
+  if (t.includes('bus') || t.includes('coach') || t.includes('transit'))
+    return { uri: '/sumo/bus.glb', scale: 1.4, maxScale: 40,
+             color: Color.fromCssColorString('#34d399'), blendAmount: 0.50 }
+
+  // Heavy truck / trailer
+  if (t.includes('truck') || t.includes('trailer') || t.includes('heavy') || t.includes('delivery') || t.includes('hgv'))
+    return { uri: '/sumo/truck.glb', scale: 1.55, maxScale: 32,
+             color: Color.fromCssColorString('#f97316'), blendAmount: 0.45 }
+
+  // Motorcycle / bicycle
+  if (t.includes('moto') || t.includes('bicycle') || t.includes('bike') || t.includes('scooter'))
+    return { uri: '/sumo/ferrari.glb', scale: 0.45, maxScale: 9,
+             color: Color.fromCssColorString('#a78bfa'), blendAmount: 0.65 }
+
+  // All passenger types — pick config from hash of vehicle ID
+  const cfg = PASSENGER_CONFIGS[idHash(vehicleId) % PASSENGER_CONFIGS.length]
+  return {
+    uri:        cfg.uri,
+    scale:      cfg.scale,
+    maxScale:   cfg.maxScale,
+    color:      Color.fromCssColorString(cfg.hex),
+    blendAmount: cfg.blend,
+  }
 }
 
 export function CesiumViewer() {
@@ -1067,7 +1125,7 @@ export function CesiumViewer() {
             sampledPos.backwardExtrapolationType = ExtrapolationType.HOLD
             sampledPos.addSample(jt, pos)
             const isEgo = id === 'f_0.0'
-            const vm = getVehicleModel(vtype)
+            const vm = getVehicleModel(vtype, id)
             const e = v.entities.add({
               id: `live_${id}`,
               position: sampledPos,
@@ -1079,10 +1137,10 @@ export function CesiumViewer() {
                 maximumScale: vm.maxScale,
                 heightReference: HeightReference.CLAMP_TO_GROUND,
                 color: isEgo
-                  ? Color.fromCssColorString('#fbbf24')   // gold for ego car
+                  ? Color.fromCssColorString('#fbbf24')
                   : (vm.color ?? Color.WHITE),
                 colorBlendMode: ColorBlendMode.MIX,
-                colorBlendAmount: isEgo ? 0.75 : (vm.color ? 0.45 : 0),
+                colorBlendAmount: isEgo ? 0.75 : (vm.blendAmount ?? (vm.color ? 0.55 : 0)),
               },
             })
             vehicleAngleMap.set(e, angle)
