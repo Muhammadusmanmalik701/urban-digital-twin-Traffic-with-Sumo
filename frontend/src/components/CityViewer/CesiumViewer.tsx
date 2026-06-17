@@ -233,9 +233,9 @@ export function CesiumViewer() {
   const hoverHandlerRef     = useRef<any>(null)
   // Car follow camera
   const followEntityRef     = useRef<any>(null)
-  const followModeRef       = useRef<'top' | 'front'>('top')
+  const followModeRef       = useRef<'top' | 'front' | 'cockpit'>('top')
   const preRenderListenerRef = useRef<any>(null)
-  const startFollowRef      = useRef<(entity: any, mode: 'top' | 'front') => void>()
+  const startFollowRef      = useRef<(entity: any, mode: 'top' | 'front' | 'cockpit') => void>()
   const lastCarPosRef       = useRef<any>(null)
   const egoFollowedRef      = useRef(false)
 
@@ -247,7 +247,7 @@ export function CesiumViewer() {
   const [liveCount, setLiveCount]   = useState(0)
   const [liveSimTime, setLiveSimTime] = useState(0)
   const [liveMsg, setLiveMsg]       = useState('')
-  const [followInfo, setFollowInfo] = useState<{ active: boolean; mode: 'top' | 'front' }>({ active: false, mode: 'top' })
+  const [followInfo, setFollowInfo] = useState<{ active: boolean; mode: 'top' | 'front' | 'cockpit' }>({ active: false, mode: 'top' })
   const [egoActive, setEgoActive]   = useState(false)
   const [egoState, setEgoState]     = useState<{ speed: number; maxSpeed: number; lane: number; autopilot: boolean }>({ speed: 0, maxSpeed: 50, lane: 0, autopilot: true })
   const egoDesiredSpeedRef          = useRef<number>(0)
@@ -268,21 +268,35 @@ export function CesiumViewer() {
       viewer.scene.postRender.removeEventListener(preRenderListenerRef.current)
     }
     preRenderListenerRef.current = null
+    // Restore car visibility if it was hidden in cockpit mode
+    if (followEntityRef.current?.model) {
+      ;(followEntityRef.current.model as any).show = new ConstantProperty(true)
+    }
     followEntityRef.current = null
     setFollowInfo({ active: false, mode: 'top' })
   }, [])
 
-  const startFollow = useCallback((entity: any, mode: 'top' | 'front') => {
+  const startFollow = useCallback((entity: any, mode: 'top' | 'front' | 'cockpit') => {
     const viewer = cesiumViewer.current
     if (!viewer || !entity) return
 
     if (preRenderListenerRef.current)
       viewer.scene.postRender.removeEventListener(preRenderListenerRef.current)
 
+    // Restore previous ego car visibility before switching modes
+    if (followEntityRef.current && followEntityRef.current.model) {
+      ;(followEntityRef.current.model as any).show = new ConstantProperty(true)
+    }
+
     followEntityRef.current = entity
     followModeRef.current = mode
 
-    // Initial camera placement for the selected mode — only done once on follow start
+    // Hide ego car model in cockpit mode (camera is inside — no need to see it)
+    if (entity.model) {
+      ;(entity.model as any).show = new ConstantProperty(mode !== 'cockpit')
+    }
+
+    // Initial camera placement
     const initPos = entity.position?.getValue(viewer.clock.currentTime)
     if (initPos) {
       const carto = Cartographic.fromCartesian(initPos)
@@ -292,18 +306,28 @@ export function CesiumViewer() {
         const alt = carto.height ?? 0
         const angleDeg = vehicleAngleMap.get(entity) ?? 0
         const heading = CesiumMath.toRadians(angleDeg + 90)
+
         if (mode === 'top') {
           viewer.camera.setView({
             destination: Cartesian3.fromDegrees(lon, lat, alt + 250),
             orientation: { heading, pitch: CesiumMath.toRadians(-90), roll: 0 },
           })
-        } else {
+        } else if (mode === 'front') {
           const behindDist = 0.00090
           const behindLon = lon - Math.sin(CesiumMath.toRadians(angleDeg)) * behindDist
           const behindLat = lat - Math.cos(CesiumMath.toRadians(angleDeg)) * behindDist
           viewer.camera.setView({
             destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 100),
-            orientation: { heading, pitch: CesiumMath.toRadians(-47), roll: 0 },
+            orientation: { heading, pitch: CesiumMath.toRadians(-45), roll: 0 },
+          })
+        } else {
+          // Cockpit: driver eye level, 2m forward, looking ahead
+          const fwdDist = 0.000018
+          const fwdLon = lon + Math.sin(CesiumMath.toRadians(angleDeg)) * fwdDist
+          const fwdLat = lat + Math.cos(CesiumMath.toRadians(angleDeg)) * fwdDist
+          viewer.camera.setView({
+            destination: Cartesian3.fromDegrees(fwdLon, fwdLat, alt + 1.5),
+            orientation: { heading, pitch: CesiumMath.toRadians(-3), roll: 0 },
           })
         }
         lastCarPosRef.current = new Cartesian3(initPos.x, initPos.y, initPos.z)
@@ -312,20 +336,39 @@ export function CesiumViewer() {
       lastCarPosRef.current = null
     }
 
-    // Per-frame: only translate camera by car's delta movement — never touch orientation
-    // so user can freely rotate/zoom while camera tracks the car
+    // Per-frame listener
     const listener = () => {
       const v = cesiumViewer.current
       const ent = followEntityRef.current
       if (!v || !ent) return
       const pos = ent.position?.getValue(v.clock.currentTime)
       if (!pos) return
-      const prev = lastCarPosRef.current
-      lastCarPosRef.current = new Cartesian3(pos.x, pos.y, pos.z)
-      if (!prev) return
-      v.camera.position.x += pos.x - prev.x
-      v.camera.position.y += pos.y - prev.y
-      v.camera.position.z += pos.z - prev.z
+
+      if (followModeRef.current === 'cockpit') {
+        // Cockpit: full setView every frame — camera stays locked inside car
+        const carto = Cartographic.fromCartesian(pos)
+        if (!carto) return
+        const lon = CesiumMath.toDegrees(carto.longitude)
+        const lat = CesiumMath.toDegrees(carto.latitude)
+        const alt = carto.height ?? 0
+        const angleDeg = vehicleAngleMap.get(ent) ?? 0
+        const heading = CesiumMath.toRadians(angleDeg + 90)
+        const fwdDist = 0.000018
+        const fwdLon = lon + Math.sin(CesiumMath.toRadians(angleDeg)) * fwdDist
+        const fwdLat = lat + Math.cos(CesiumMath.toRadians(angleDeg)) * fwdDist
+        v.camera.setView({
+          destination: Cartesian3.fromDegrees(fwdLon, fwdLat, alt + 1.5),
+          orientation: { heading, pitch: CesiumMath.toRadians(-3), roll: 0 },
+        })
+      } else {
+        // Top / Follow: delta-only tracking — user can freely rotate/zoom
+        const prev = lastCarPosRef.current
+        lastCarPosRef.current = new Cartesian3(pos.x, pos.y, pos.z)
+        if (!prev) return
+        v.camera.position.x += pos.x - prev.x
+        v.camera.position.y += pos.y - prev.y
+        v.camera.position.z += pos.z - prev.z
+      }
     }
 
     viewer.scene.postRender.addEventListener(listener)
@@ -1295,7 +1338,7 @@ export function CesiumViewer() {
                 : 'bg-white/8 text-gray-400 hover:bg-white/15 hover:text-white'
             }`}
           >
-            ⬆ Top View
+            ⬆ Top
           </button>
           <button
             onClick={() => startFollowRef.current?.(followEntityRef.current, 'front')}
@@ -1305,7 +1348,17 @@ export function CesiumViewer() {
                 : 'bg-white/8 text-gray-400 hover:bg-white/15 hover:text-white'
             }`}
           >
-            🚗 Follow View
+            🚗 Follow
+          </button>
+          <button
+            onClick={() => startFollowRef.current?.(followEntityRef.current, 'cockpit')}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+              followInfo.mode === 'cockpit'
+                ? 'bg-amber-500 text-white shadow-lg shadow-amber-900/30'
+                : 'bg-white/8 text-gray-400 hover:bg-white/15 hover:text-white'
+            }`}
+          >
+            🚘 Drive
           </button>
           <button
             onClick={stopFollow}
