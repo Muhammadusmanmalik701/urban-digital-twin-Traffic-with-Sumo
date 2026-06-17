@@ -236,6 +236,7 @@ export function CesiumViewer() {
   const followModeRef       = useRef<'top' | 'front'>('top')
   const preRenderListenerRef = useRef<any>(null)
   const startFollowRef      = useRef<(entity: any, mode: 'top' | 'front') => void>()
+  const lastCarPosRef       = useRef<any>(null)
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -271,47 +272,56 @@ export function CesiumViewer() {
     const viewer = cesiumViewer.current
     if (!viewer || !entity) return
 
-    // Clear previous follow
-    if (preRenderListenerRef.current) {
+    if (preRenderListenerRef.current)
       viewer.scene.postRender.removeEventListener(preRenderListenerRef.current)
-    }
 
     followEntityRef.current = entity
     followModeRef.current = mode
 
+    // Initial camera placement for the selected mode — only done once on follow start
+    const initPos = entity.position?.getValue(viewer.clock.currentTime)
+    if (initPos) {
+      const carto = Cartographic.fromCartesian(initPos)
+      if (carto) {
+        const lon = CesiumMath.toDegrees(carto.longitude)
+        const lat = CesiumMath.toDegrees(carto.latitude)
+        const alt = carto.height ?? 0
+        const angleDeg = vehicleAngleMap.get(entity) ?? 0
+        const heading = CesiumMath.toRadians(angleDeg + 90)
+        if (mode === 'top') {
+          viewer.camera.setView({
+            destination: Cartesian3.fromDegrees(lon, lat, alt + 250),
+            orientation: { heading, pitch: CesiumMath.toRadians(-90), roll: 0 },
+          })
+        } else {
+          const behindDist = 0.00090
+          const behindLon = lon - Math.sin(CesiumMath.toRadians(angleDeg)) * behindDist
+          const behindLat = lat - Math.cos(CesiumMath.toRadians(angleDeg)) * behindDist
+          viewer.camera.setView({
+            destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 100),
+            orientation: { heading, pitch: CesiumMath.toRadians(-47), roll: 0 },
+          })
+        }
+        lastCarPosRef.current = new Cartesian3(initPos.x, initPos.y, initPos.z)
+      }
+    } else {
+      lastCarPosRef.current = null
+    }
+
+    // Per-frame: only translate camera by car's delta movement — never touch orientation
+    // so user can freely rotate/zoom while camera tracks the car
     const listener = () => {
       const v = cesiumViewer.current
       const ent = followEntityRef.current
       if (!v || !ent) return
       const pos = ent.position?.getValue(v.clock.currentTime)
       if (!pos) return
-
-      // Convert Cartesian3 → lon/lat/alt
-      const carto = Cartographic.fromCartesian(pos)
-      if (!carto) return
-      const lon = CesiumMath.toDegrees(carto.longitude)
-      const lat = CesiumMath.toDegrees(carto.latitude)
-      const alt = carto.height ?? 0
-
-      const angleDeg = vehicleAngleMap.get(ent) ?? 0
-      const heading  = CesiumMath.toRadians(angleDeg + 90)
-
-      if (followModeRef.current === 'top') {
-        // Bird's eye: directly above, straight down — car perfectly centered
-        v.camera.setView({
-          destination: Cartesian3.fromDegrees(lon, lat, alt + 250),
-          orientation: { heading, pitch: CesiumMath.toRadians(-90), roll: 0 },
-        })
-      } else {
-        // Follow/front: 100m behind car, 50m above
-        const behindDist = 0.00090  // ~100m in degrees
-        const behindLon = lon - Math.sin(CesiumMath.toRadians(angleDeg)) * behindDist
-        const behindLat = lat - Math.cos(CesiumMath.toRadians(angleDeg)) * behindDist
-        v.camera.setView({
-          destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 100),
-          orientation: { heading, pitch: CesiumMath.toRadians(-47), roll: 0 },
-        })
-      }
+      const prev = lastCarPosRef.current
+      lastCarPosRef.current = new Cartesian3(pos.x, pos.y, pos.z)
+      if (!prev) return
+      v.camera.position.x += pos.x - prev.x
+      v.camera.position.y += pos.y - prev.y
+      v.camera.position.z += pos.z - prev.z
     }
 
     viewer.scene.postRender.addEventListener(listener)
@@ -1168,7 +1178,7 @@ export function CesiumViewer() {
         <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-gray-950/95 backdrop-blur-xl border border-white/15 rounded-2xl px-4 py-2.5 shadow-2xl">
           <span className="text-amber-400 text-xs font-semibold mr-1">🎯 Following car</span>
           <button
-            onClick={() => { followModeRef.current = 'top'; setFollowInfo(f => ({ ...f, mode: 'top' })) }}
+            onClick={() => startFollowRef.current?.(followEntityRef.current, 'top')}
             className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
               followInfo.mode === 'top'
                 ? 'bg-sky-500 text-white shadow-lg shadow-sky-900/30'
@@ -1178,7 +1188,7 @@ export function CesiumViewer() {
             ⬆ Top View
           </button>
           <button
-            onClick={() => { followModeRef.current = 'front'; setFollowInfo(f => ({ ...f, mode: 'front' })) }}
+            onClick={() => startFollowRef.current?.(followEntityRef.current, 'front')}
             className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
               followInfo.mode === 'front'
                 ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-900/30'
