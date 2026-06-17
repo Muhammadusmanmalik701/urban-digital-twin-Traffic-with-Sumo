@@ -29,6 +29,9 @@ export function RightPanel() {
     loadingRoads,
     loadProgress,
     roadCount,
+    showOsmBuildings,
+    toggleOsmBuildings,
+    buildingsLoading,
   } = useMapControlStore()
 
   const handleAreaToggle = (area: string) => {
@@ -109,10 +112,42 @@ export function RightPanel() {
         </div>
       </div>
 
+      {/* ── 3D Buildings toggle ── */}
+      <div>
+        <div className="text-xs text-gray-400 font-semibold mb-2 uppercase tracking-wider">
+          ② 3D Buildings
+        </div>
+        <button
+          onClick={toggleOsmBuildings}
+          disabled={buildingsLoading}
+          className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 border transition-all text-xs font-semibold ${
+            showOsmBuildings
+              ? 'bg-sky-500/20 border-sky-400/50 text-sky-300 shadow-lg shadow-sky-900/20'
+              : 'bg-white/5 border-white/10 text-gray-300 hover:bg-white/10'
+          }`}
+        >
+          {/* checkbox visual */}
+          <span className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${
+            showOsmBuildings ? 'bg-sky-400 border-sky-400' : 'border-gray-500'
+          }`}>
+            {showOsmBuildings && <span className="text-black text-[10px] font-bold leading-none">✓</span>}
+          </span>
+          <span className="flex-1 text-left">
+            {buildingsLoading ? '⏳ Loading buildings…' : 'Show 3D Buildings'}
+          </span>
+          <span className="text-base">🏢</span>
+        </button>
+        {showOsmBuildings && !buildingsLoading && (
+          <p className="text-xs text-gray-500 mt-1.5 text-center">
+            Zooming to building view…
+          </p>
+        )}
+      </div>
+
       {/* ── Load button ── */}
       <div>
         <div className="text-xs text-gray-400 font-semibold mb-2 uppercase tracking-wider">
-          ② Load Road Network
+          ③ Load Road Network
         </div>
         <button
           onClick={triggerLoad}
@@ -144,7 +179,7 @@ export function RightPanel() {
       {roadCount > 0 && (
         <div>
           <div className="text-xs text-gray-400 font-semibold mb-2 uppercase tracking-wider">
-            ③ Road Type Filter
+            ④ Road Type Filter
           </div>
           <div className="bg-white/5 rounded-xl border border-white/8 p-2 space-y-1.5">
             {ROAD_TYPES.map(({ key, label, color }) => (

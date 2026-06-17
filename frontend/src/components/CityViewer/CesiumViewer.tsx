@@ -5,25 +5,32 @@ import {
   Cartesian3,
   Cartesian2,
   Color,
+  ColorBlendMode,
   HeightReference,
   NearFarScalar,
   Math as CesiumMath,
   PolylineGlowMaterialProperty,
+  PolylineDashMaterialProperty,
   VerticalOrigin,
   HorizontalOrigin,
   LabelStyle,
   createWorldTerrainAsync,
-  createOsmBuildingsAsync,
+  Cesium3DTileset,
   ConstantPositionProperty,
   ConstantProperty,
   CzmlDataSource,
-  VelocityOrientationProperty,
+  SampledPositionProperty,
+  LinearApproximation,
+  ExtrapolationType,
+  PolygonHierarchy,
   JulianDate,
   ClockRange,
   SceneMode,
   EllipsoidTerrainProvider,
   Transforms,
   HeadingPitchRoll,
+  ScreenSpaceEventHandler,
+  ScreenSpaceEventType,
 } from 'cesium'
 import 'cesium/Build/Cesium/Widgets/widgets.css'
 import { useSimulationStore } from '../../store/simulationStore'
@@ -68,17 +75,93 @@ function getRoadType(tags: Record<string, string>, railway?: string): RoadType {
   return 'local'
 }
 
-async function fetchRoads(osmName: string) {
-  const q = `[out:json][timeout:90];
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+]
+
+async function overpassFetch(query: string): Promise<any> {
+  let lastErr: Error = new Error('No mirrors')
+  for (const url of OVERPASS_MIRRORS) {
+    try {
+      const r = await fetch(url, {
+        method: 'POST', body: query,
+        headers: { 'Content-Type': 'text/plain' },
+        signal: AbortSignal.timeout(60_000),
+      })
+      if (r.status === 429 || r.status === 504) { lastErr = new Error(`HTTP ${r.status} from ${url}`); continue }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json()
+    } catch (e) {
+      lastErr = e as Error
+    }
+  }
+  throw lastErr
+}
+
+// Roads only — triggered by "Load Road Network" button
+async function fetchAreaData(osmName: string) {
+  return overpassFetch(`[out:json][timeout:55];
 area["name"="${osmName}"]["admin_level"=8]->.s;
-(way["highway"](area.s);way["railway"="tram"](area.s);way["railway"="rail"](area.s););
-out geom;`
-  const r = await fetch('https://overpass-api.de/api/interpreter', {
-    method: 'POST', body: q, headers: { 'Content-Type': 'text/plain' },
+(
+  way["highway"](area.s);
+  way["railway"="tram"](area.s);
+  way["railway"="rail"](area.s);
+);
+out geom;`)
+}
+
+// Admin boundary only — small Overpass query (just 1 relation)
+async function fetchBoundary(osmName: string) {
+  return overpassFetch(`[out:json][timeout:30];
+relation["name"="${osmName}"]["admin_level"=8];
+out geom;`)
+}
+
+// Buildings from pre-fetched local file, fallback to BDTOPO WFS
+const AREA_BBOXES: Record<string, [number,number,number,number]> = {
+  'Bordeaux':  [-0.600, 44.828, -0.558, 44.850],
+  'Pessac':    [-0.636, 44.796, -0.596, 44.816],
+  'Talence':   [-0.605, 44.798, -0.570, 44.820],
+  'Mérignac':  [-0.706, 44.825, -0.666, 44.845],
+  'Gradignan': [-0.634, 44.762, -0.594, 44.782],
+}
+const AREA_FILE: Record<string, string> = {
+  'Bordeaux':  '/data/buildings/bordeaux-city.geojson',
+  'Pessac':    '/data/buildings/pessac.geojson',
+  'Talence':   '/data/buildings/talence.geojson',
+  'Mérignac':  '/data/buildings/merignac.geojson',
+  'Gradignan': '/data/buildings/gradignan.geojson',
+}
+
+async function fetchBuildings(osmName: string): Promise<any> {
+  // 1) Try local pre-fetched file (fast, no timeouts)
+  const localPath = AREA_FILE[osmName]
+  if (localPath) {
+    try {
+      const r = await fetch(localPath)
+      if (r.ok) return r.json()
+    } catch { /* fall through to WFS */ }
+  }
+  // 2) Live BDTOPO WFS — French government, free, real heights, no API key
+  const bbox = AREA_BBOXES[osmName]
+  if (!bbox) throw new Error(`No bbox for ${osmName}`)
+  const [west, south, east, north] = bbox
+  const params = new URLSearchParams({
+    SERVICE: 'WFS', VERSION: '2.0.0', REQUEST: 'GetFeature',
+    TYPENAMES: 'BDTOPO_V3:batiment',
+    BBOX: `${west},${south},${east},${north},EPSG:4326`,
+    OUTPUTFORMAT: 'application/json',
+    COUNT: '5000',
   })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  const r = await fetch(`https://data.geopf.fr/wfs/ows?${params}`, {
+    signal: AbortSignal.timeout(60_000),
+  })
+  if (!r.ok) throw new Error(`BDTOPO HTTP ${r.status}`)
   return r.json()
 }
+
 
 const roadTypeMap = new WeakMap<object, RoadType>()
 
@@ -90,14 +173,42 @@ interface SimState {
 // ─── Live SUMO state ───────────────────────────────────────────────────────────
 type LiveState = 'idle' | 'connecting' | 'waiting' | 'running' | 'error' | 'stopped'
 
-// Convert SUMO compass angle → Cesium orientation quaternion
-// SUMO: clockwise from North (0=N, 90=E, 180=S, 270=W)
-// Cesium heading: clockwise from East in local ENU frame
-// Fix: subtract 90° to shift reference axis from North → East
+// Fly to altitude where OSM 3D tile buildings become visible (LOD requires < ~2000m)
+function flyToBuildingView(viewer: any) {
+  if (!viewer) return
+  const currentHeight = viewer.camera.positionCartographic?.height ?? 99999
+  if (currentHeight <= 2000) return  // already close enough
+  const pitchRad = CesiumMath.toRadians(-50)
+  const targetLon = -0.5792
+  const targetLat = 44.8378
+  const targetHeight = 1200
+  const latOffset = (targetHeight * Math.tan(Math.abs(pitchRad))) / 111320
+  viewer.camera.flyTo({
+    destination: Cartesian3.fromDegrees(targetLon, targetLat - latOffset, targetHeight),
+    orientation: { heading: 0, pitch: pitchRad, roll: 0 },
+    duration: 2.5,
+  })
+}
+
+// SUMO angle → Cesium orientation (SUMO CW-from-North, Cesium CW-from-East → +90° offset)
 function sumoAngleToOrientation(lon: number, lat: number, angleDeg: number) {
   const pos = Cartesian3.fromDegrees(lon, lat, 0)
   const hpr = new HeadingPitchRoll(CesiumMath.toRadians(angleDeg + 90.0), 0, 0)
   return Transforms.headingPitchRollQuaternion(pos, hpr)
+}
+
+interface VehicleModel { uri: string; scale: number; maxScale: number; color?: Color }
+function getVehicleModel(vtype: string): VehicleModel {
+  const t = (vtype || '').toLowerCase()
+  if (t.includes('bus') || t.includes('coach'))
+    return { uri: '/sumo/truck.glb', scale: 2.2, maxScale: 45,
+             color: Color.fromCssColorString('#34d399') }   // green bus
+  if (t.includes('truck') || t.includes('trailer') || t.includes('heavy') || t.includes('delivery'))
+    return { uri: '/sumo/truck.glb', scale: 1.4, maxScale: 28 }  // milk-truck colour
+  if (t.includes('moto') || t.includes('bicycle') || t.includes('bike'))
+    return { uri: '/sumo/ferrari.glb', scale: 0.55, maxScale: 11,
+             color: Color.fromCssColorString('#fbbf24') }   // yellow moped
+  return { uri: '/sumo/ferrari.glb', scale: 1.0, maxScale: 20 }  // red passenger car
 }
 
 export function CesiumViewer() {
@@ -112,7 +223,17 @@ export function CesiumViewer() {
   // Live sim refs
   const liveWS          = useRef<WebSocket | null>(null)
   const liveEntities    = useRef<Map<string, any>>(new Map())
+  const liveEpoch       = useRef<JulianDate | null>(null)
+  // OSM building polygon entities (from road-load trigger)
+  const buildingPolygons = useRef<any[]>([])
+  // Per-area boundary + buildings (from area-select trigger)
+  const areaEntities        = useRef<Map<string, any[]>>(new Map())
+  // Hover boundary entities (pre-fetched, hidden by default)
+  const hoverBoundaryCache  = useRef<Map<string, any[]>>(new Map())
+  const hoveredAreaKey      = useRef<string | null>(null)
+  const hoverHandlerRef     = useRef<ScreenSpaceEventHandler | null>(null)
 
+  const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
     loaded: false, playing: false, speed: 1, timeStr: '00:00', is3D: true,
   })
@@ -128,6 +249,7 @@ export function CesiumViewer() {
     flyTarget, loadTrigger, roadFilter, selectedAreas,
     toggleArea, flyToArea,
     setRoadCount, setLoadingRoads, setLoadProgress,
+    showOsmBuildings, setBuildingsLoading,
   } = useMapControlStore()
 
   // ── Init Cesium (cancelled flag → no React StrictMode double-init) ─────────
@@ -171,6 +293,7 @@ export function CesiumViewer() {
       lv.scene.fog.enabled = false
       if (lv.scene.skyAtmosphere) lv.scene.skyAtmosphere.show = false
       lv.scene.globe.showGroundAtmosphere = false
+      lv.scene.globe.depthTestAgainstTerrain = false  // allow entities below terrain to show
 
       lv.camera.flyTo({ destination: Cartesian3.fromDegrees(-0.58, 44.85, 45000), duration: 3 })
 
@@ -204,11 +327,7 @@ export function CesiumViewer() {
         areaMarkers.current.set(key, e)
       })
 
-      // OSM buildings
-      try {
-        const b = await createOsmBuildingsAsync()
-        if (!cancelled) { osmBuildings.current = lv!.scene.primitives.add(b) } else b.destroy()
-      } catch {}
+      // OSM 3D buildings are loaded on-demand via the "Show 3D Buildings" toggle in the panel
 
       if (cancelled) return
 
@@ -231,6 +350,86 @@ export function CesiumViewer() {
       })
 
       cesiumViewer.current = lv
+      setViewerReady(true)
+
+      // ── Pre-load OSM 3D buildings at startup (hidden) ──────────────────────
+      Cesium3DTileset.fromIonAssetId(96188).then(b => {
+        if (cancelled || !cesiumViewer.current || cesiumViewer.current.isDestroyed()) {
+          b.destroy(); return
+        }
+        b.show = false
+        osmBuildings.current = cesiumViewer.current.scene.primitives.add(b)
+        console.log('[Buildings] OSM pre-loaded OK (asset 96188)')
+      }).catch(e => console.error('[Buildings] Pre-load FAILED:', e))
+
+      // ── Pre-fetch all area boundaries for instant hover display ──────────
+      Promise.all(
+        Object.entries(AREAS).map(([key, area]) =>
+          fetchBoundary(area.osmName)
+            .then(data => ({ key, data }))
+            .catch(() => null)
+        )
+      ).then(results => {
+        if (cancelled || !lv || lv.isDestroyed()) return
+        results.forEach(r => {
+          if (!r) return
+          const { key, data } = r
+          const list: any[] = []
+          ;(data.elements ?? []).forEach((el: any) => {
+            if (el.type !== 'relation') return
+            ;(el.members ?? []).forEach((m: any) => {
+              if (m.role !== 'outer' || !m.geometry?.length) return
+              const pts = m.geometry.map((n: any) =>
+                Cartesian3.fromDegrees(n.lon, n.lat, 40)
+              )
+              const e = lv!.entities.add({
+                show: false,
+                polyline: {
+                  positions: pts,
+                  width: 3,
+                  material: new PolylineGlowMaterialProperty({
+                    color: Color.fromCssColorString('#f59e0b'),
+                    glowPower: 0.3,
+                  }),
+                  clampToGround: false,
+                },
+              })
+              list.push(e)
+            })
+          })
+          hoverBoundaryCache.current.set(key, list)
+        })
+      })
+
+      // ── Mouse-move hover handler ──────────────────────────────────────────
+      const hoverHandler = new ScreenSpaceEventHandler(lv.canvas)
+      hoverHandler.setInputAction((mv: { endPosition: Cartesian2 }) => {
+        const v = cesiumViewer.current
+        if (!v) return
+        const picked = v.scene.pick(mv.endPosition)
+        const newKey: string | null =
+          picked?.id?.properties?.markerType?.getValue() === 'area'
+            ? picked.id.properties.areaKey.getValue()
+            : null
+
+        if (newKey === hoveredAreaKey.current) return  // nothing changed
+
+        // Hide previous hover boundary
+        if (hoveredAreaKey.current) {
+          hoverBoundaryCache.current.get(hoveredAreaKey.current)
+            ?.forEach(e => { e.show = false })
+        }
+        // Show new hover boundary
+        if (newKey) {
+          hoverBoundaryCache.current.get(newKey)
+            ?.forEach(e => { e.show = true })
+          lv!.canvas.style.cursor = 'pointer'
+        } else {
+          lv!.canvas.style.cursor = ''
+        }
+        hoveredAreaKey.current = newKey
+      }, ScreenSpaceEventType.MOUSE_MOVE)
+      hoverHandlerRef.current = hoverHandler
 
       api.getBuildings().then((bldgs: any[]) => {
         if (cancelled || !cesiumViewer.current) return
@@ -261,7 +460,7 @@ export function CesiumViewer() {
             properties: { buildingId: b.id },
           })
         })
-      }).catch(console.error)
+      }).catch(() => { /* backend not running — skip analytics markers */ })
 
       } catch (err) {
         // Outer safety net — prevents unhandled promise rejection crashing the app
@@ -272,6 +471,8 @@ export function CesiumViewer() {
     return () => {
       cancelled = true
       clockTickOff.current?.()
+      hoverHandlerRef.current?.destroy()
+      hoverHandlerRef.current = null
       if (lv) { lv.destroy(); lv = null }
       cesiumViewer.current = null
     }
@@ -283,14 +484,21 @@ export function CesiumViewer() {
     if (!flyTarget || !viewer) return
     const area = AREAS[flyTarget.area]
     if (!area) return
+
+    // Place camera SOUTH of target so the blue dot appears in the screen center.
+    // Camera at (lon, lat − offset, height) looking North at −50° pitch.
+    // Ground intersection = camera_lat + height × tan(50°) / 111320° = area.lat  ✓
+    const pitchRad = CesiumMath.toRadians(-50)
+    const latOffset = (area.height * Math.tan(Math.abs(pitchRad))) / 111320
+
     viewer.camera.flyTo({
-      destination: Cartesian3.fromDegrees(area.lon, area.lat, area.height),
-      orientation: { heading: 0, pitch: CesiumMath.toRadians(-42), roll: 0 },
+      destination: Cartesian3.fromDegrees(area.lon, area.lat - latOffset, area.height),
+      orientation: { heading: CesiumMath.toRadians(0), pitch: pitchRad, roll: 0 },
       duration: 2.5,
     })
   }, [flyTarget])
 
-  // ── Multi-area road loading ─────────────────────────────────────────────────
+  // ── Road loading (triggered by "Load Road Network" button) ────────────────────
   useEffect(() => {
     if (!loadTrigger) return
     const viewer = cesiumViewer.current
@@ -306,12 +514,12 @@ export function CesiumViewer() {
         const key = selectedAreas[i]
         const area = AREAS[key]
         if (!area) continue
-        setLoadProgress(`Loading ${key} (${i + 1}/${selectedAreas.length})…`)
+        setLoadProgress(`Loading ${key} roads (${i + 1}/${selectedAreas.length})…`)
         try {
-          const data = await fetchRoads(area.osmName)
+          const data = await fetchAreaData(area.osmName)
           const filter = useMapControlStore.getState().roadFilter
           data.elements.forEach((el: any) => {
-            if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) return
+            if (el.type !== 'way' || !el.geometry?.length || el.geometry.length < 2) return
             const tags = el.tags || {}
             const rtype = getRoadType(tags, tags.railway)
             const style = ROAD_STYLES[rtype]
@@ -331,12 +539,153 @@ export function CesiumViewer() {
             total++
           })
           setRoadCount(total)
-        } catch (e) { console.error(`Roads failed for ${key}:`, e) }
+        } catch (e) { console.error(`[Roads] Failed for ${key}:`, e) }
       }
       setLoadProgress(''); setLoadingRoads(false)
+
+      // Fly to the first selected area so roads are visible (not stuck at 45 km overview)
+      const firstArea = AREAS[selectedAreas[0]]
+      if (firstArea && viewer) {
+        const pitchRad  = CesiumMath.toRadians(-50)
+        const latOffset = (firstArea.height * Math.tan(Math.abs(pitchRad))) / 111320
+        viewer.camera.flyTo({
+          destination: Cartesian3.fromDegrees(firstArea.lon, firstArea.lat - latOffset, firstArea.height),
+          orientation: { heading: CesiumMath.toRadians(0), pitch: pitchRad, roll: 0 },
+          duration: 2,
+        })
+      }
     }
     load()
   }, [loadTrigger])
+
+  // ── Area boundary + buildings (triggered by area selection) ────────────────────
+  useEffect(() => {
+    const viewer = cesiumViewer.current
+    if (!viewer) return
+
+    areaEntities.current.forEach(list => list.forEach(e => viewer.entities.remove(e)))
+    areaEntities.current.clear()
+    if (!selectedAreas.length) return
+
+    const BLDG_COLOR   = new Color(147/255, 197/255, 253/255, 0.20)
+    const BLDG_OUTLINE = new Color(59/255,  130/255, 246/255, 0.50)
+    const DASH_COLOR   = Color.fromCssColorString('#ef4444')
+
+    let cancelled = false
+    ;(async () => {
+      for (const key of selectedAreas) {
+        if (cancelled) break
+        const area = AREAS[key]
+        if (!area) continue
+        const list: any[] = []
+
+        // ── 1. Admin boundary (Overpass, small query) ─────────────────────────
+        try {
+          const boundaryData = await fetchBoundary(area.osmName)
+          if (cancelled) break
+          ;(boundaryData.elements ?? []).forEach((el: any) => {
+            if (el.type !== 'relation') return
+            ;(el.members ?? []).forEach((m: any) => {
+              if (m.role !== 'outer' || !m.geometry?.length) return
+              const pts = m.geometry.map((n: any) => Cartesian3.fromDegrees(n.lon, n.lat, 30))
+              const e = viewer.entities.add({
+                polyline: {
+                  positions: pts,
+                  width: 2.5,
+                  material: new PolylineDashMaterialProperty({ color: DASH_COLOR, dashLength: 18 }),
+                  clampToGround: false,
+                },
+              })
+              list.push(e)
+            })
+          })
+        } catch (err) {
+          console.warn(`[Boundary] Failed for ${key}:`, err)
+        }
+
+        // ── 2. Buildings (local file → BDTOPO WFS fallback) ──────────────────
+        try {
+          const bldgData = await fetchBuildings(area.osmName)
+          if (cancelled) break
+
+          const isBDTOPO = !!bldgData.features  // GeoJSON FeatureCollection
+          const feats = isBDTOPO
+            ? bldgData.features
+            : (bldgData.elements ?? []).filter((el: any) => el.type === 'way' && el.tags?.building)
+
+          feats.forEach((feat: any) => {
+            try {
+              let coords: any[]
+              let h: number
+
+              if (isBDTOPO) {
+                // GeoJSON from local file or BDTOPO WFS
+                h = feat.properties?.height ?? 9.6
+                const geom = feat.geometry
+                if (!geom || !['Polygon','MultiPolygon'].includes(geom.type)) return
+                const ring = geom.type === 'MultiPolygon'
+                  ? geom.coordinates[0][0]
+                  : geom.coordinates[0]
+                if (!ring || ring.length < 3) return
+                coords = ring.map(([lon, lat]: [number,number]) => Cartesian3.fromDegrees(lon, lat))
+              } else {
+                // Overpass fallback (should rarely trigger now)
+                if (!feat.geometry || feat.geometry.length < 3) return
+                const tags = feat.tags ?? {}
+                const lvl = parseFloat(tags['building:levels'] ?? tags['levels'] ?? '3')
+                h = isNaN(lvl) ? 9.6 : Math.max(lvl, 1) * 3.2
+                coords = feat.geometry.map((n: any) => Cartesian3.fromDegrees(n.lon, n.lat))
+              }
+
+              const e = viewer.entities.add({
+                polygon: {
+                  hierarchy: new PolygonHierarchy(coords),
+                  height: 0,
+                  heightReference: HeightReference.CLAMP_TO_GROUND,
+                  extrudedHeight: h,
+                  extrudedHeightReference: HeightReference.RELATIVE_TO_GROUND,
+                  material: BLDG_COLOR,
+                  outline: true,
+                  outlineColor: BLDG_OUTLINE,
+                  outlineWidth: 1,
+                },
+              })
+              list.push(e)
+            } catch { /* skip malformed */ }
+          })
+        } catch (err) {
+          console.warn(`[Buildings] Failed for ${key}:`, err)
+        }
+
+        areaEntities.current.set(key, list)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [selectedAreas.join(','), viewerReady])
+
+  // ── OSM 3D Buildings toggle ─────────────────────────────────────────────────
+  useEffect(() => {
+    const viewer = cesiumViewer.current
+    if (!viewer || !viewerReady) return
+
+    if (osmBuildings.current && !osmBuildings.current.isDestroyed()) {
+      // Pre-loaded at startup — just flip show
+      osmBuildings.current.show = showOsmBuildings
+      if (showOsmBuildings) flyToBuildingView(viewer)
+    } else if (showOsmBuildings) {
+      // Fallback: pre-load not yet done, load now
+      setBuildingsLoading(true)
+      Cesium3DTileset.fromIonAssetId(96188)
+        .then(b => {
+          if (!cesiumViewer.current || cesiumViewer.current.isDestroyed()) { b.destroy(); return }
+          osmBuildings.current = cesiumViewer.current.scene.primitives.add(b)
+          flyToBuildingView(cesiumViewer.current)
+          console.log('[Buildings] OSM loaded via fallback (asset 96188)')
+        })
+        .catch(e => console.error('[Buildings] Fallback FAILED:', e))
+        .finally(() => setBuildingsLoading(false))
+    }
+  }, [showOsmBuildings, viewerReady])
 
   // ── Road filter visibility ──────────────────────────────────────────────────
   useEffect(() => {
@@ -346,9 +695,12 @@ export function CesiumViewer() {
     })
   }, [roadFilter])
 
-  // ── OSM buildings ───────────────────────────────────────────────────────────
+  // ── Buildings visibility (both Ion tileset + OSM polygons) ──────────────────
   useEffect(() => {
+    // Ion tileset (if loaded)
     if (osmBuildings.current) osmBuildings.current.show = showBuildings
+    // OSM polygon buildings
+    buildingPolygons.current.forEach(e => { if (e.polygon) e.polygon.show = showBuildings })
   }, [showBuildings])
 
   // ── Area marker highlight ───────────────────────────────────────────────────
@@ -411,13 +763,6 @@ export function CesiumViewer() {
 
     viewer.dataSources.add(ds)
     sumoDS.current = ds
-
-    // Add velocity-based orientation so trucks face the direction they travel
-    ds.entities.values.forEach(entity => {
-      if (entity.position) {
-        entity.orientation = new VelocityOrientationProperty(entity.position)
-      }
-    })
 
     // Clock setup
     viewer.clock.shouldAnimate = false
@@ -526,43 +871,64 @@ export function CesiumViewer() {
       if (data.type === 'FeatureCollection') {
         setLiveState('running')
         setLiveCount(data.vehicleCount ?? 0)
-        setLiveSimTime(data.simTime ?? 0)
+        const simTime: number = data.simTime ?? 0
+        setLiveSimTime(simTime)
 
         const v = cesiumViewer.current
         if (!v) return
 
+        // Anchor wall-clock epoch on first frame
+        if (!liveEpoch.current) {
+          liveEpoch.current = JulianDate.now()
+          v.clock.shouldAnimate = true
+          v.clock.clockRange = ClockRange.UNBOUNDED
+        }
+        const jt = JulianDate.addSeconds(liveEpoch.current, simTime, new JulianDate())
+        v.clock.currentTime = JulianDate.addSeconds(jt, 1.0, new JulianDate())
+
         const activeIds = new Set<string>()
         ;(data.features ?? []).forEach((f: any) => {
-          const id: string = String(f.id ?? f.properties?.id)
-          const [lon, lat] = f.geometry.coordinates
-          const angle: number = f.properties?.angle ?? 0
+          const id: string  = String(f.id ?? f.properties?.id)
+          const [lon, lat]  = f.geometry.coordinates
+          const angle       = f.properties?.angle  ?? 0
+          const vtype       = f.properties?.type   ?? 'passenger'
           activeIds.add(id)
 
-          const pos = Cartesian3.fromDegrees(lon, lat, 0)
-          const ori = new ConstantProperty(sumoAngleToOrientation(lon, lat, angle))
+          const pos    = Cartesian3.fromDegrees(lon, lat, 0)
+          const orient = sumoAngleToOrientation(lon, lat, angle)
 
           if (liveEntities.current.has(id)) {
-            const e = liveEntities.current.get(id)
-            e.position = new ConstantPositionProperty(pos)
-            e.orientation = ori
+            const ent = liveEntities.current.get(id)
+            ;(ent.position as SampledPositionProperty).addSample(jt, pos)
+            ent.orientation = new ConstantProperty(orient)
           } else {
+            const sampledPos = new SampledPositionProperty()
+            sampledPos.setInterpolationOptions({ interpolationAlgorithm: LinearApproximation, interpolationDegree: 1 })
+            sampledPos.forwardExtrapolationType = ExtrapolationType.HOLD
+            sampledPos.backwardExtrapolationType = ExtrapolationType.HOLD
+            sampledPos.addSample(jt, pos)
+            const vm = getVehicleModel(vtype)
             const e = v.entities.add({
               id: `live_${id}`,
-              position: new ConstantPositionProperty(pos),
-              orientation: ori,
+              position: sampledPos,
+              orientation: new ConstantProperty(orient),
               model: {
-                uri: '/sumo/ferrari.glb',
-                scale: 1.0,
+                uri: vm.uri,
+                scale: vm.scale,
                 minimumPixelSize: 10,
-                maximumScale: 20,
+                maximumScale: vm.maxScale,
                 heightReference: HeightReference.CLAMP_TO_GROUND,
+                ...(vm.color ? {
+                  color: vm.color,
+                  colorBlendMode: ColorBlendMode.MIX,
+                  colorBlendAmount: 0.45,
+                } : {}),
               },
             })
             liveEntities.current.set(id, e)
           }
         })
 
-        // Remove vehicles that left the simulation
         liveEntities.current.forEach((e, id) => {
           if (!activeIds.has(id)) {
             v.entities.remove(e)
@@ -588,6 +954,7 @@ export function CesiumViewer() {
     liveWS.current = null
     liveEntities.current.forEach((e) => cesiumViewer.current?.entities.remove(e))
     liveEntities.current.clear()
+    liveEpoch.current = null
     setLiveState('idle')
     setLiveCount(0)
     setLiveSimTime(0)
