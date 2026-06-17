@@ -1,74 +1,89 @@
 #!/usr/bin/env python3
 """
-SUMO Live WebSocket Server  (FCD file-watch mode — no TraCI)
-─────────────────────────────────────────────────────────────
-Flow:
-  1. Click "Run Simulation" in browser
-     → sumo-gui opens with sim.sumocfg
-  2. Press ▶ Play inside SUMO-GUI yourself
-     → SUMO writes vehicle positions to fcd.xml in real-time
-  3. This server watches fcd.xml and streams new positions
-     → Browser map shows the same vehicles moving in sync
-
-No TraCI, no version-mismatch issues.
-User has full SUMO-GUI control (play / pause / speed slider).
+SUMO TraCI Live WebSocket Server
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Runs SUMO via TraCI, streams all vehicle positions to browser,
+and accepts real-time keyboard control commands for ego car (f_0.0).
 
 Requirements:
   pip install websockets
+  SUMO installed + SUMO_HOME env var set
 
-Usage (from sumo_files/ folder):
+WebSocket messages IN (from browser):
+  { "type": "start" }
+  { "type": "stop" }
+  { "type": "control", "action": "set_speed", "value": 50 }   # km/h
+  { "type": "control", "action": "brake" }
+  { "type": "control", "action": "lane_left" }
+  { "type": "control", "action": "lane_right" }
+  { "type": "control", "action": "autopilot" }                 # release to SUMO
+
+WebSocket messages OUT (to browser):
+  { "type": "status",          "state": "...", "message": "..." }
+  { "type": "FeatureCollection", "simTime": ..., "features": [...] }
+  { "type": "ego_state",       "speed": 45.2, "maxSpeed": 50, "lane": 1, "road": "..." }
+
+Usage:
+  cd simulations/sumo
   python sumo_live_server.py
-  python sumo_live_server.py --delay 3     # 3-step broadcast delay
-  python sumo_live_server.py --port 8765
 """
 
 import asyncio
 import json
 import os
-import re
-import subprocess
+import queue
 import sys
-from collections import deque
+import threading
 from pathlib import Path
 
 try:
     import websockets
 except ImportError:
-    print("ERROR: Run   pip install websockets   first.")
+    print("ERROR: pip install websockets")
     sys.exit(1)
 
-# ── Settings ──────────────────────────────────────────────────────────────────
-WS_PORT      = 8765
-SUMOCFG      = "sim.sumocfg"
-FCD_FILE     = "fcd.xml"        # written by SUMO during simulation
-DELAY_STEPS  = 0                # buffer N steps before broadcasting (0 = instant)
+# Add SUMO tools to Python path so traci can be imported
+SUMO_HOME = os.environ.get("SUMO_HOME", "")
+if SUMO_HOME:
+    sys.path.insert(0, str(Path(SUMO_HOME) / "tools"))
 
-# Regex to find a complete <timestep> block in the FCD file
-_TS_RE = re.compile(
-    r'<timestep\s+time="([^"]+)"[^>]*>(.*?)</timestep>',
-    re.DOTALL,
-)
-_VEH_RE = re.compile(r'<vehicle\b([^/]*)/>')
-_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+try:
+    import traci
+    import traci.exceptions
+except ImportError:
+    print("ERROR: traci not found.")
+    print("  Set SUMO_HOME environment variable to your SUMO install folder.")
+    print(r"  Example (Windows): setx SUMO_HOME 'C:\Program Files (x86)\Eclipse\Sumo'")
+    sys.exit(1)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+WS_PORT = 8765
+SUMOCFG = "sim.sumocfg"
+EGO_ID  = "f_0.0"
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 CLIENTS: set = set()
-sim_task     = None
-sumo_proc    = None
+_main_loop:  asyncio.AbstractEventLoop | None = None
+_pos_queue:  asyncio.Queue | None = None   # TraCI thread → WS broadcast
+_cmd_queue:  queue.Queue = queue.Queue()   # WS handler  → TraCI thread
+_sim_stop    = threading.Event()
+_sim_thread: threading.Thread | None = None
 
 
-# ── Find SUMO-GUI ─────────────────────────────────────────────────────────────
+# ── SUMO binary finder ────────────────────────────────────────────────────────
 
 def find_sumo_gui() -> str:
-    sumo_home = os.environ.get("SUMO_HOME", "")
     candidates = []
-    if sumo_home:
-        candidates.append(str(Path(sumo_home) / "bin" / "sumo-gui.exe"))
+    if SUMO_HOME:
+        candidates += [
+            str(Path(SUMO_HOME) / "bin" / "sumo-gui.exe"),
+            str(Path(SUMO_HOME) / "bin" / "sumo-gui"),
+        ]
     candidates += [
         r"C:\Program Files (x86)\Eclipse\Sumo\bin\sumo-gui.exe",
         r"C:\Program Files\Eclipse\Sumo\bin\sumo-gui.exe",
         r"C:\sumo\bin\sumo-gui.exe",
-        "sumo-gui",   # hope it's on PATH
+        "sumo-gui",
     ]
     for c in candidates:
         if Path(c).exists() or c == "sumo-gui":
@@ -76,7 +91,7 @@ def find_sumo_gui() -> str:
     return "sumo-gui"
 
 
-# ── Broadcast ─────────────────────────────────────────────────────────────────
+# ── Broadcast helpers ─────────────────────────────────────────────────────────
 
 async def broadcast(payload: str) -> None:
     dead = set()
@@ -88,188 +103,175 @@ async def broadcast(payload: str) -> None:
     CLIENTS.difference_update(dead)
 
 
-async def send_status(state: str, msg: str = "") -> None:
-    print(f"[STATUS] {state}  {msg}")
-    await broadcast(json.dumps({"type": "status", "state": state, "message": msg}))
+def _push(payload: str) -> None:
+    """Thread-safe: queue a message for async broadcast (called from TraCI thread)."""
+    if _main_loop and _pos_queue:
+        asyncio.run_coroutine_threadsafe(_pos_queue.put(payload), _main_loop)
 
 
-# ── FCD file watcher ──────────────────────────────────────────────────────────
-
-def parse_timestep(time_str: str, body: str) -> dict:
-    """Parse one <timestep> block into a GeoJSON FeatureCollection dict."""
-    features = []
-    for vm in _VEH_RE.finditer(body):
-        attrs = dict(_ATTR_RE.findall(vm.group(1)))
-        try:
-            # lane="edgeName_laneIndex" → extract road name
-            lane = attrs.get("lane", "")
-            road = lane.rsplit("_", 1)[0] if lane else "unknown"
-
-            speed_ms  = float(attrs.get("speed", 0))
-            speed_kmh = round(speed_ms * 3.6, 1)
-
-            features.append({
-                "type": "Feature",
-                "id":   attrs.get("id", "?"),
-                "geometry": {
-                    "type":        "Point",
-                    # fcd-output.geo=true → x=lon, y=lat
-                    "coordinates": [float(attrs["x"]), float(attrs["y"]), 0],
-                },
-                "properties": {
-                    "id":       attrs.get("id"),
-                    "speed":    speed_kmh,       # km/h
-                    "angle":    float(attrs.get("angle", 0)),
-                    "road":     road,
-                    "lane":     lane,
-                    "type":     attrs.get("type", "car"),
-                    "simTime":  float(time_str),
-                },
-            })
-        except (KeyError, ValueError):
-            pass
-    return {
-        "type":         "FeatureCollection",
-        "simTime":      float(time_str),
-        "vehicleCount": len(features),
-        "features":     features,
-    }
+async def _broadcaster() -> None:
+    """Async task: drains _pos_queue and broadcasts to all WS clients."""
+    while True:
+        payload = await _pos_queue.get()
+        await broadcast(payload)
 
 
-async def watch_fcd(fcd_path: str, delay_steps: int) -> None:
-    """
-    Tail fcd_path as SUMO writes it.
-    Buffer delay_steps timesteps before broadcasting so the browser
-    always lags behind SUMO by that many steps.
-    """
-    fcd = Path(fcd_path)
+# ── Ego car control ───────────────────────────────────────────────────────────
 
-    # Wait for SUMO to create / reset the file
-    print(f"[FCD] Waiting for {fcd_path} …")
-    prev_size = fcd.stat().st_size if fcd.exists() else -1
-
-    # Give SUMO up to 30 s to start writing
-    for _ in range(60):
-        await asyncio.sleep(0.5)
-        if fcd.exists():
-            cur = fcd.stat().st_size
-            if cur != prev_size:   # file was touched / reset by SUMO
-                break
-    else:
-        await send_status("error",
-            f"SUMO did not write to {fcd_path} within 30s. "
-            "Make sure you pressed ▶ Play in SUMO-GUI.")
+def _apply_control(cmd: dict) -> None:
+    """Apply one control command to ego car via TraCI. Runs in TraCI thread."""
+    if EGO_ID not in traci.vehicle.getIDList():
         return
 
-    print(f"[FCD] {fcd_path} detected — streaming positions …")
-    await send_status("running",
-        "SUMO is running — web map is syncing in real-time.")
+    action = cmd.get("action", "")
+    value  = cmd.get("value", 0)
 
-    file_pos  = 0
-    text_buf  = ""
-    step_buf: deque = deque()   # delay buffer
-
-    while True:
-        try:
-            with open(fcd_path, "r", encoding="utf-8", errors="ignore") as f:
-                # Detect if SUMO restarted (file shrunk → truncated)
-                f.seek(0, 2)
-                cur_size = f.tell()
-                if cur_size < file_pos:
-                    print("[FCD] File reset detected — rewinding.")
-                    file_pos = 0
-                    text_buf = ""
-                    step_buf.clear()
-
-                f.seek(file_pos)
-                chunk = f.read()
-                file_pos = f.tell()
-        except OSError:
-            await asyncio.sleep(0.2)
-            continue
-
-        if chunk:
-            text_buf += chunk
-            # Extract all complete <timestep> blocks
-            while True:
-                m = _TS_RE.search(text_buf)
-                if not m:
-                    break
-                ts_data = parse_timestep(m.group(1), m.group(2))
-                text_buf = text_buf[m.end():]
-
-                step_buf.append(json.dumps(ts_data))
-
-                # Once buffer is full, start draining the front
-                if len(step_buf) > delay_steps:
-                    await broadcast(step_buf.popleft())
-
-        # Check if SUMO process ended
-        if sumo_proc and sumo_proc.poll() is not None:
-            # Flush remaining delay buffer
-            while step_buf:
-                await broadcast(step_buf.popleft())
-                await asyncio.sleep(0.05)
-            await send_status("finished", "Simulation complete.")
-            print("[FCD] SUMO process ended.")
-            return
-
-        await asyncio.sleep(0.05)  # poll every 50 ms
-
-
-# ── Simulation task ───────────────────────────────────────────────────────────
-
-async def run_simulation(delay_steps: int) -> None:
-    global sumo_proc
-
-    binary  = find_sumo_gui()
-    sumocfg = Path(SUMOCFG).resolve()
-    fcd     = sumocfg.parent / FCD_FILE
-
-    # Delete old fcd.xml so we can detect when SUMO creates the new one
     try:
-        fcd.unlink(missing_ok=True)
-    except Exception:
+        if action == "set_speed":
+            # value is km/h; -1 means release to SUMO autopilot
+            ms = float(value) / 3.6 if float(value) >= 0 else -1.0
+            traci.vehicle.setSpeed(EGO_ID, ms)
+
+        elif action == "brake":
+            cur = traci.vehicle.getSpeed(EGO_ID)
+            traci.vehicle.setSpeed(EGO_ID, max(0.0, cur - 3.0))
+
+        elif action == "lane_left":
+            lane = traci.vehicle.getLaneIndex(EGO_ID)
+            if lane > 0:
+                traci.vehicle.changeLane(EGO_ID, lane - 1, 4.0)
+
+        elif action == "lane_right":
+            lane = traci.vehicle.getLaneIndex(EGO_ID)
+            road = traci.vehicle.getRoadID(EGO_ID)
+            try:
+                n = traci.edge.getLaneNumber(road)
+                if lane < n - 1:
+                    traci.vehicle.changeLane(EGO_ID, lane + 1, 4.0)
+            except Exception:
+                pass
+
+        elif action == "autopilot":
+            traci.vehicle.setSpeed(EGO_ID, -1)   # release speed control to SUMO
+
+    except traci.exceptions.TraCIException:
         pass
 
-    cmd = [binary, "-c", str(sumocfg)]
-    print(f"[SUMO] Launching: {' '.join(cmd)}")
-    await send_status("starting",
-        "SUMO-GUI is opening… press ▶ Play inside SUMO when ready.")
+
+# ── TraCI simulation thread ───────────────────────────────────────────────────
+
+def _traci_thread() -> None:
+    """
+    Runs in background thread.
+    Steps simulation, reads positions, pushes GeoJSON + ego_state to broadcast queue.
+    Drains control commands between each step.
+    """
+    binary = find_sumo_gui()
+    cfg    = str(Path(SUMOCFG).resolve())
+
+    _push(json.dumps({
+        "type": "status", "state": "starting",
+        "message": "SUMO-GUI opening… simulation will start automatically.",
+    }))
 
     try:
-        sumo_proc = subprocess.Popen(cmd, cwd=str(sumocfg.parent))
-    except FileNotFoundError:
-        await send_status("error",
-            f"'{binary}' not found. "
-            "Set the SUMO_HOME environment variable to your SUMO install folder "
-            r"(e.g. C:\Program Files (x86)\Eclipse\Sumo)  "
-            "and restart the server.")
-        sumo_proc = None
+        traci.start([binary, "-c", cfg, "--start"])
+    except Exception as e:
+        _push(json.dumps({
+            "type": "status", "state": "error",
+            "message": f"SUMO failed to start: {e}. Check SUMO_HOME.",
+        }))
         return
 
-    try:
-        await watch_fcd(str(fcd), delay_steps)
-    except asyncio.CancelledError:
-        print("[SIM] Cancelled by user.")
-    finally:
-        if sumo_proc and sumo_proc.poll() is None:
-            sumo_proc.terminate()
-        sumo_proc = None
+    _push(json.dumps({
+        "type": "status", "state": "running",
+        "message": f"Simulation running. Ego car '{EGO_ID}' will appear at its depart time.",
+    }))
 
-    await send_status("idle", "Simulation ended. Click Run Simulation to start again.")
+    try:
+        while not _sim_stop.is_set() and traci.simulation.getMinExpectedNumber() > 0:
+
+            # Process pending control commands before stepping
+            while not _cmd_queue.empty():
+                try:
+                    _apply_control(_cmd_queue.get_nowait())
+                except Exception:
+                    pass
+
+            traci.simulationStep()
+
+            vehicle_ids = traci.vehicle.getIDList()
+            sim_time    = traci.simulation.getTime()
+
+            # Build GeoJSON FeatureCollection
+            features = []
+            for vid in vehicle_ids:
+                try:
+                    x, y     = traci.vehicle.getPosition(vid)
+                    lon, lat = traci.simulation.convertGeo(x, y)
+                    features.append({
+                        "type": "Feature",
+                        "id":   vid,
+                        "geometry": {
+                            "type":        "Point",
+                            "coordinates": [lon, lat, 0],
+                        },
+                        "properties": {
+                            "id":      vid,
+                            "speed":   round(traci.vehicle.getSpeed(vid) * 3.6, 1),
+                            "angle":   traci.vehicle.getAngle(vid),
+                            "type":    traci.vehicle.getTypeID(vid),
+                            "simTime": sim_time,
+                        },
+                    })
+                except Exception:
+                    pass
+
+            _push(json.dumps({
+                "type":         "FeatureCollection",
+                "simTime":      sim_time,
+                "vehicleCount": len(features),
+                "features":     features,
+            }))
+
+            # Ego car live state (speed, lane, road)
+            if EGO_ID in vehicle_ids:
+                try:
+                    _push(json.dumps({
+                        "type":     "ego_state",
+                        "speed":    round(traci.vehicle.getSpeed(EGO_ID) * 3.6, 1),
+                        "maxSpeed": round(traci.vehicle.getMaxSpeed(EGO_ID) * 3.6, 1),
+                        "lane":     traci.vehicle.getLaneIndex(EGO_ID),
+                        "road":     traci.vehicle.getRoadID(EGO_ID),
+                    }))
+                except Exception:
+                    pass
+
+    except Exception as e:
+        _push(json.dumps({
+            "type": "status", "state": "error",
+            "message": f"Simulation error: {e}",
+        }))
+    finally:
+        try:
+            traci.close()
+        except Exception:
+            pass
+        _push(json.dumps({
+            "type": "status", "state": "idle",
+            "message": "Simulation ended. Click Run Simulation to start again.",
+        }))
 
 
 # ── WebSocket handler ─────────────────────────────────────────────────────────
 
 async def ws_handler(websocket) -> None:
-    global sim_task, sumo_proc
-
+    global _sim_thread
     CLIENTS.add(websocket)
     print(f"[WS] Client connected  ({len(CLIENTS)} total)")
 
-    # Sync state to new client
-    state = "running" if (sim_task and not sim_task.done()) else "idle"
+    # Sync state to newly connected client
+    state = "running" if (_sim_thread and _sim_thread.is_alive()) else "idle"
     await websocket.send(json.dumps({"type": "status", "state": state}))
 
     try:
@@ -282,27 +284,29 @@ async def ws_handler(websocket) -> None:
             ctype = cmd.get("type")
 
             if ctype == "start":
-                if sim_task and not sim_task.done():
+                if _sim_thread and _sim_thread.is_alive():
                     await websocket.send(json.dumps({
                         "type": "status", "state": "running",
                         "message": "Already running.",
                     }))
                 else:
-                    delay = int(cmd.get("delay", DELAY_STEPS))
-                    print(f"[CMD] start  delay={delay} steps")
-                    sim_task = asyncio.create_task(run_simulation(delay))
+                    _sim_stop.clear()
+                    _sim_thread = threading.Thread(target=_traci_thread, daemon=True)
+                    _sim_thread.start()
 
             elif ctype == "stop":
-                print("[CMD] stop")
-                if sim_task and not sim_task.done():
-                    sim_task.cancel()
-                if sumo_proc and sumo_proc.poll() is None:
-                    sumo_proc.terminate()
-                sumo_proc = None
+                _sim_stop.set()
+                try:
+                    traci.close()
+                except Exception:
+                    pass
                 await broadcast(json.dumps({
                     "type": "status", "state": "idle",
                     "message": "Stopped by user.",
                 }))
+
+            elif ctype == "control":
+                _cmd_queue.put(cmd)
 
     except websockets.exceptions.ConnectionClosedError:
         pass
@@ -314,34 +318,31 @@ async def ws_handler(websocket) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    import argparse
-    p = argparse.ArgumentParser(description="SUMO Live WebSocket Server")
-    p.add_argument("--port",  type=int, default=WS_PORT,     help="WebSocket port (default 8765)")
-    p.add_argument("--delay", type=int, default=DELAY_STEPS, help="Broadcast delay in steps (default 0)")
-    args = p.parse_args()
+    global _main_loop, _pos_queue
+    _main_loop = asyncio.get_running_loop()
+    _pos_queue = asyncio.Queue()
+
+    asyncio.create_task(_broadcaster())
 
     binary = find_sumo_gui()
-
     print("=" * 60)
-    print("  SUMO Live WebSocket Server  (file-watch mode)")
+    print("  SUMO TraCI Live WebSocket Server")
     print("=" * 60)
-    print(f"  SUMO-GUI  : {binary}")
-    print(f"  Config    : {SUMOCFG}")
-    print(f"  FCD file  : {FCD_FILE}  (watched live)")
-    print(f"  Delay     : {args.delay} steps")
-    print(f"  WS URL    : ws://localhost:{args.port}")
+    print(f"  SUMO-GUI : {binary}")
+    print(f"  Config   : {SUMOCFG}")
+    print(f"  Ego car  : {EGO_ID}")
+    print(f"  WS URL   : ws://localhost:{WS_PORT}")
+    print("=" * 60)
+    print("  Keyboard controls (when ego car is active in browser):")
+    print("    W / ↑  Accelerate (+5 km/h)")
+    print("    S / ↓  Brake")
+    print("    A / ←  Lane change left")
+    print("    D / →  Lane change right")
+    print("    R      Release to SUMO autopilot")
     print("=" * 60)
     print()
-    print("Steps:")
-    print("  1. Open http://localhost:8080 in browser")
-    print("  2. Click the 🚗 car icon → click  Run Simulation")
-    print("  3. SUMO-GUI window opens")
-    print("  4. Press ▶ Play inside SUMO-GUI")
-    print("  5. Browser map shows the same vehicles in real-time")
-    print()
-    print("Press Ctrl+C to stop server.\n")
 
-    async with websockets.serve(ws_handler, "localhost", args.port):
+    async with websockets.serve(ws_handler, "localhost", WS_PORT):
         await asyncio.Future()
 
 

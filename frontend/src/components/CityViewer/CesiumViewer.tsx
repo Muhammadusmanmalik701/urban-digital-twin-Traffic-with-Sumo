@@ -249,6 +249,8 @@ export function CesiumViewer() {
   const [liveMsg, setLiveMsg]       = useState('')
   const [followInfo, setFollowInfo] = useState<{ active: boolean; mode: 'top' | 'front' }>({ active: false, mode: 'top' })
   const [egoActive, setEgoActive]   = useState(false)
+  const [egoState, setEgoState]     = useState<{ speed: number; maxSpeed: number; lane: number; autopilot: boolean }>({ speed: 0, maxSpeed: 50, lane: 0, autopilot: true })
+  const egoDesiredSpeedRef          = useRef<number>(0)
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
@@ -333,6 +335,52 @@ export function CesiumViewer() {
 
   // Keep ref in sync so init-effect handler can call it
   startFollowRef.current = startFollow
+
+  // ── Ego car keyboard controls ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!egoActive) return
+
+    const sendControl = (action: string, value?: number) => {
+      const ws = liveWS.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      ws.send(JSON.stringify({ type: 'control', action, ...(value !== undefined ? { value } : {}) }))
+    }
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Don't capture when typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      switch (e.key) {
+        case 'w': case 'W': case 'ArrowUp': {
+          const newSpeed = Math.min(egoDesiredSpeedRef.current + 5, egoState.maxSpeed)
+          egoDesiredSpeedRef.current = newSpeed
+          sendControl('set_speed', newSpeed)
+          break
+        }
+        case 's': case 'S': case 'ArrowDown':
+          egoDesiredSpeedRef.current = Math.max(0, egoDesiredSpeedRef.current - 5)
+          sendControl('brake')
+          break
+        case 'a': case 'A': case 'ArrowLeft':
+          sendControl('lane_left')
+          break
+        case 'd': case 'D': case 'ArrowRight':
+          sendControl('lane_right')
+          break
+        case 'r': case 'R':
+          egoDesiredSpeedRef.current = -1
+          sendControl('autopilot')
+          break
+        case ' ':
+          e.preventDefault()
+          egoDesiredSpeedRef.current = 0
+          sendControl('set_speed', 0)
+          break
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [egoActive, egoState.maxSpeed])
 
   // ── Init Cesium (cancelled flag → no React StrictMode double-init) ─────────
   useEffect(() => {
@@ -923,6 +971,17 @@ export function CesiumViewer() {
         return
       }
 
+      // Ego car state update from TraCI
+      if (data.type === 'ego_state') {
+        setEgoState({
+          speed:     data.speed    ?? 0,
+          maxSpeed:  data.maxSpeed ?? 50,
+          lane:      data.lane     ?? 0,
+          autopilot: egoDesiredSpeedRef.current < 0,
+        })
+        return
+      }
+
       // Vehicle position update: GeoJSON FeatureCollection
       if (data.type === 'FeatureCollection') {
         setLiveState('running')
@@ -1190,11 +1249,35 @@ export function CesiumViewer() {
         </button>
       )}
 
-      {/* ── Ego car badge ── */}
+      {/* ── Ego car HUD ── */}
       {egoActive && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-amber-500/20 backdrop-blur-xl border border-amber-400/50 rounded-2xl px-4 py-2 shadow-2xl">
-          <span className="text-amber-300 text-xs font-bold tracking-wide">🚗 EGO CAR ACTIVE</span>
-          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2">
+          {/* Status badge */}
+          <div className="flex items-center gap-2 bg-amber-500/20 backdrop-blur-xl border border-amber-400/50 rounded-2xl px-4 py-2 shadow-2xl">
+            <span className="text-amber-300 text-xs font-bold tracking-wide">🚗 EGO CAR</span>
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            <span className="text-white text-sm font-bold font-mono">{egoState.speed.toFixed(0)}</span>
+            <span className="text-gray-400 text-xs">km/h</span>
+            <span className="text-gray-500 text-xs mx-1">|</span>
+            <span className="text-gray-400 text-xs">Lane {egoState.lane + 1}</span>
+          </div>
+          {/* Keyboard controls hint */}
+          <div className="flex items-center gap-1.5 bg-gray-950/80 backdrop-blur border border-white/10 rounded-xl px-3 py-1.5">
+            {[
+              { key: 'W', label: '▲ Accel' },
+              { key: 'S', label: '▼ Brake' },
+              { key: 'A', label: '◄ Left' },
+              { key: 'D', label: '► Right' },
+              { key: 'R', label: 'Auto' },
+              { key: '␣', label: 'Stop' },
+            ].map(({ key, label }) => (
+              <div key={key} className="flex items-center gap-1">
+                <span className="bg-white/10 border border-white/20 rounded px-1.5 py-0.5 text-white text-xs font-mono font-bold">{key}</span>
+                <span className="text-gray-500 text-xs">{label}</span>
+                <span className="text-gray-700 text-xs mx-0.5">·</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
