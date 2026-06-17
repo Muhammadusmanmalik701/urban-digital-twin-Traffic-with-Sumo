@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import {
+// Cesium loaded via CDN (sync script in index.html head) — window.Cesium is defined before this module runs
+const {
   Viewer,
   Ion,
   Cartesian3,
@@ -8,7 +9,7 @@ import {
   ColorBlendMode,
   HeightReference,
   NearFarScalar,
-  Math as CesiumMath,
+  Math: CesiumMath,
   PolylineGlowMaterialProperty,
   PolylineDashMaterialProperty,
   VerticalOrigin,
@@ -31,15 +32,12 @@ import {
   HeadingPitchRoll,
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
-} from 'cesium'
-import 'cesium/Build/Cesium/Widgets/widgets.css'
+} = (window as any).Cesium
 import { useSimulationStore } from '../../store/simulationStore'
 import { useBuildingStore } from '../../store/buildingStore'
 import { useLayerStore } from '../../store/layerStore'
 import { useMapControlStore } from '../../store/mapControlStore'
 import { api } from '../../services/api'
-
-Ion.defaultAccessToken = import.meta.env.VITE_CESIUM_TOKEN || ''
 
 export const AREAS: Record<string, { lon: number; lat: number; height: number; osmName: string; icon: string }> = {
   'Pessac':        { lon: -0.6150, lat: 44.8060, height: 1600, osmName: 'Pessac',    icon: '🏘️' },
@@ -197,7 +195,7 @@ function sumoAngleToOrientation(lon: number, lat: number, angleDeg: number) {
   return Transforms.headingPitchRollQuaternion(pos, hpr)
 }
 
-interface VehicleModel { uri: string; scale: number; maxScale: number; color?: Color }
+interface VehicleModel { uri: string; scale: number; maxScale: number; color?: any }
 function getVehicleModel(vtype: string): VehicleModel {
   const t = (vtype || '').toLowerCase()
   if (t.includes('bus') || t.includes('coach'))
@@ -213,17 +211,17 @@ function getVehicleModel(vtype: string): VehicleModel {
 
 export function CesiumViewer() {
   const viewerRef       = useRef<HTMLDivElement>(null)
-  const cesiumViewer    = useRef<Viewer | null>(null)
+  const cesiumViewer    = useRef<any>(null)
   const vehicleEntities = useRef<Map<string, any>>(new Map())
   const roadEntities    = useRef<any[]>([])
   const osmBuildings    = useRef<any>(null)
   const areaMarkers     = useRef<Map<string, any>>(new Map())
-  const sumoDS          = useRef<CzmlDataSource | null>(null)
+  const sumoDS          = useRef<any>(null)
   const clockTickOff    = useRef<() => void>()
   // Live sim refs
   const liveWS          = useRef<WebSocket | null>(null)
   const liveEntities    = useRef<Map<string, any>>(new Map())
-  const liveEpoch       = useRef<JulianDate | null>(null)
+  const liveEpoch       = useRef<any>(null)
   // OSM building polygon entities (from road-load trigger)
   const buildingPolygons = useRef<any[]>([])
   // Per-area boundary + buildings (from area-select trigger)
@@ -231,7 +229,7 @@ export function CesiumViewer() {
   // Hover boundary entities (pre-fetched, hidden by default)
   const hoverBoundaryCache  = useRef<Map<string, any[]>>(new Map())
   const hoveredAreaKey      = useRef<string | null>(null)
-  const hoverHandlerRef     = useRef<ScreenSpaceEventHandler | null>(null)
+  const hoverHandlerRef     = useRef<any>(null)
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -256,7 +254,7 @@ export function CesiumViewer() {
   useEffect(() => {
     if (!viewerRef.current) return
     let cancelled = false
-    let lv: Viewer | null = null
+    let lv: any = null
 
     ;(async () => {
       try {
@@ -332,7 +330,7 @@ export function CesiumViewer() {
       if (cancelled) return
 
       // Entity click
-      lv.selectedEntityChanged.addEventListener((sel) => {
+      lv.selectedEntityChanged.addEventListener((sel: any) => {
         if (!sel) return
         const mtype = sel.properties?.markerType?.getValue?.()
         if (mtype === 'area') {
@@ -353,14 +351,14 @@ export function CesiumViewer() {
       setViewerReady(true)
 
       // ── Pre-load OSM 3D buildings at startup (hidden) ──────────────────────
-      Cesium3DTileset.fromIonAssetId(96188).then(b => {
+      Cesium3DTileset.fromIonAssetId(96188).then((b: any) => {
         if (cancelled || !cesiumViewer.current || cesiumViewer.current.isDestroyed()) {
           b.destroy(); return
         }
         b.show = false
         osmBuildings.current = cesiumViewer.current.scene.primitives.add(b)
         console.log('[Buildings] OSM pre-loaded OK (asset 96188)')
-      }).catch(e => console.error('[Buildings] Pre-load FAILED:', e))
+      }).catch((e: any) => console.error('[Buildings] Pre-load FAILED:', e))
 
       // ── Pre-fetch all area boundaries for instant hover display ──────────
       Promise.all(
@@ -403,7 +401,7 @@ export function CesiumViewer() {
 
       // ── Mouse-move hover handler ──────────────────────────────────────────
       const hoverHandler = new ScreenSpaceEventHandler(lv.canvas)
-      hoverHandler.setInputAction((mv: { endPosition: Cartesian2 }) => {
+      hoverHandler.setInputAction((mv: any) => {
         const v = cesiumViewer.current
         if (!v) return
         const picked = v.scene.pick(mv.endPosition)
@@ -676,13 +674,13 @@ export function CesiumViewer() {
       // Fallback: pre-load not yet done, load now
       setBuildingsLoading(true)
       Cesium3DTileset.fromIonAssetId(96188)
-        .then(b => {
+        .then((b: any) => {
           if (!cesiumViewer.current || cesiumViewer.current.isDestroyed()) { b.destroy(); return }
           osmBuildings.current = cesiumViewer.current.scene.primitives.add(b)
           flyToBuildingView(cesiumViewer.current)
           console.log('[Buildings] OSM loaded via fallback (asset 96188)')
         })
-        .catch(e => console.error('[Buildings] Fallback FAILED:', e))
+        .catch((e: any) => console.error('[Buildings] Fallback FAILED:', e))
         .finally(() => setBuildingsLoading(false))
     }
   }, [showOsmBuildings, viewerReady])
@@ -770,7 +768,7 @@ export function CesiumViewer() {
     viewer.clock.clockRange = ClockRange.LOOP_STOP
 
     // Live time display
-    const off = viewer.clock.onTick.addEventListener((clock) => {
+    const off = viewer.clock.onTick.addEventListener((clock: any) => {
       const secs = JulianDate.secondsDifference(clock.currentTime, clock.startTime)
       const m = Math.floor(secs / 60).toString().padStart(2, '0')
       const s = Math.floor(secs % 60).toString().padStart(2, '0')
@@ -899,7 +897,7 @@ export function CesiumViewer() {
 
           if (liveEntities.current.has(id)) {
             const ent = liveEntities.current.get(id)
-            ;(ent.position as SampledPositionProperty).addSample(jt, pos)
+            ;(ent.position as any).addSample(jt, pos)
             ent.orientation = new ConstantProperty(orient)
           } else {
             const sampledPos = new SampledPositionProperty()
