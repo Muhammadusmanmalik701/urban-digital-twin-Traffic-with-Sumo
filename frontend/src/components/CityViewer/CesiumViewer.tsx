@@ -32,6 +32,8 @@ const {
   HeadingPitchRoll,
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
+  HeadingPitchRange,
+  Matrix4,
 } = (window as any).Cesium
 import { useSimulationStore } from '../../store/simulationStore'
 import { useBuildingStore } from '../../store/buildingStore'
@@ -161,7 +163,8 @@ async function fetchBuildings(osmName: string): Promise<any> {
 }
 
 
-const roadTypeMap = new WeakMap<object, RoadType>()
+const roadTypeMap    = new WeakMap<object, RoadType>()
+const vehicleAngleMap = new WeakMap<object, number>()
 
 // ─── Static CZML sim state ─────────────────────────────────────────────────────
 interface SimState {
@@ -229,6 +232,11 @@ export function CesiumViewer() {
   const hoverBoundaryCache  = useRef<Map<string, any[]>>(new Map())
   const hoveredAreaKey      = useRef<string | null>(null)
   const hoverHandlerRef     = useRef<any>(null)
+  // Car follow camera
+  const followEntityRef     = useRef<any>(null)
+  const followModeRef       = useRef<'top' | 'front'>('top')
+  const preRenderListenerRef = useRef<any>(null)
+  const startFollowRef      = useRef<(entity: any, mode: 'top' | 'front') => void>()
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -238,6 +246,7 @@ export function CesiumViewer() {
   const [liveCount, setLiveCount]   = useState(0)
   const [liveSimTime, setLiveSimTime] = useState(0)
   const [liveMsg, setLiveMsg]       = useState('')
+  const [followInfo, setFollowInfo] = useState<{ active: boolean; mode: 'top' | 'front' }>({ active: false, mode: 'top' })
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
@@ -247,6 +256,55 @@ export function CesiumViewer() {
     toggleArea, flyToArea,
     setRoadCount, setLoadingRoads, setLoadProgress,
   } = useMapControlStore()
+
+  // ── Car follow camera ────────────────────────────────────────────────────────
+  const stopFollow = useCallback(() => {
+    const viewer = cesiumViewer.current
+    if (preRenderListenerRef.current && viewer) {
+      viewer.scene.preRender.removeEventListener(preRenderListenerRef.current)
+      viewer.camera.lookAtTransform(Matrix4.IDENTITY)
+    }
+    preRenderListenerRef.current = null
+    followEntityRef.current = null
+    setFollowInfo({ active: false, mode: 'top' })
+  }, [])
+
+  const startFollow = useCallback((entity: any, mode: 'top' | 'front') => {
+    const viewer = cesiumViewer.current
+    if (!viewer || !entity) return
+
+    // Clear previous follow
+    if (preRenderListenerRef.current) {
+      viewer.scene.preRender.removeEventListener(preRenderListenerRef.current)
+      viewer.camera.lookAtTransform(Matrix4.IDENTITY)
+    }
+
+    followEntityRef.current = entity
+    followModeRef.current = mode
+
+    const listener = () => {
+      const v = cesiumViewer.current
+      const ent = followEntityRef.current
+      if (!v || !ent) return
+      const pos = ent.position?.getValue(v.clock.currentTime)
+      if (!pos) return
+      const angleDeg = vehicleAngleMap.get(ent) ?? 0
+      const heading = CesiumMath.toRadians(angleDeg + 90)
+      if (followModeRef.current === 'top') {
+        v.camera.lookAt(pos, new HeadingPitchRange(heading, CesiumMath.toRadians(-88), 60))
+      } else {
+        // Front/follow: behind the car, slightly above
+        v.camera.lookAt(pos, new HeadingPitchRange(heading + Math.PI, CesiumMath.toRadians(-18), 28))
+      }
+    }
+
+    viewer.scene.preRender.addEventListener(listener)
+    preRenderListenerRef.current = listener
+    setFollowInfo({ active: true, mode })
+  }, [])
+
+  // Keep ref in sync so init-effect handler can call it
+  startFollowRef.current = startFollow
 
   // ── Init Cesium (cancelled flag → no React StrictMode double-init) ─────────
   useEffect(() => {
@@ -336,6 +394,12 @@ export function CesiumViewer() {
           const store = useMapControlStore.getState()
           if (!store.selectedAreas.includes(key)) store.toggleArea(key)
           store.flyToArea(key)
+          lv!.selectedEntity = undefined
+          return
+        }
+        // Car click (live SUMO vehicles have a model)
+        if (sel.model) {
+          startFollowRef.current?.(sel, 'top')
           lv!.selectedEntity = undefined
           return
         }
@@ -469,6 +533,10 @@ export function CesiumViewer() {
       clockTickOff.current?.()
       hoverHandlerRef.current?.destroy()
       hoverHandlerRef.current = null
+      if (preRenderListenerRef.current && lv) {
+        lv.scene.preRender.removeEventListener(preRenderListenerRef.current)
+        preRenderListenerRef.current = null
+      }
       if (lv) { lv.destroy(); lv = null }
       cesiumViewer.current = null
     }
@@ -861,6 +929,7 @@ export function CesiumViewer() {
             const ent = liveEntities.current.get(id)
             ;(ent.position as any).addSample(jt, pos)
             ent.orientation = new ConstantProperty(orient)
+            vehicleAngleMap.set(ent, angle)
           } else {
             const sampledPos = new SampledPositionProperty()
             sampledPos.setInterpolationOptions({ interpolationAlgorithm: LinearApproximation, interpolationDegree: 1 })
@@ -885,6 +954,7 @@ export function CesiumViewer() {
                 } : {}),
               },
             })
+            vehicleAngleMap.set(e, angle)
             liveEntities.current.set(id, e)
           }
         })
@@ -1075,6 +1145,39 @@ export function CesiumViewer() {
         >
           {sim.is3D ? '🗺️ 2D' : '🌐 3D'}
         </button>
+      )}
+
+      {/* ── Car follow camera UI ── */}
+      {followInfo.active && (
+        <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-gray-950/95 backdrop-blur-xl border border-white/15 rounded-2xl px-4 py-2.5 shadow-2xl">
+          <span className="text-amber-400 text-xs font-semibold mr-1">🎯 Following car</span>
+          <button
+            onClick={() => { followModeRef.current = 'top'; setFollowInfo(f => ({ ...f, mode: 'top' })) }}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+              followInfo.mode === 'top'
+                ? 'bg-sky-500 text-white shadow-lg shadow-sky-900/30'
+                : 'bg-white/8 text-gray-400 hover:bg-white/15 hover:text-white'
+            }`}
+          >
+            ⬆ Top View
+          </button>
+          <button
+            onClick={() => { followModeRef.current = 'front'; setFollowInfo(f => ({ ...f, mode: 'front' })) }}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+              followInfo.mode === 'front'
+                ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-900/30'
+                : 'bg-white/8 text-gray-400 hover:bg-white/15 hover:text-white'
+            }`}
+          >
+            🚗 Follow View
+          </button>
+          <button
+            onClick={stopFollow}
+            className="px-3 py-1 rounded-lg text-xs font-semibold bg-red-500/20 text-red-400 hover:bg-red-500/35 hover:text-red-300 transition-all border border-red-500/30"
+          >
+            ✕ Stop
+          </button>
+        </div>
       )}
     </div>
   )
