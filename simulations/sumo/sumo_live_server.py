@@ -137,22 +137,25 @@ def _apply_control(cmd: dict) -> None:
             traci.vehicle.setSpeed(EGO_ID, max(0.0, cur - 3.0))
 
         elif action == "lane_left":
+            road = traci.vehicle.getRoadID(EGO_ID)
+            if road.startswith(':'):  # on junction — skip
+                return
             lane = traci.vehicle.getLaneIndex(EGO_ID)
             if lane > 0:
-                traci.vehicle.changeLane(EGO_ID, lane - 1, 4.0)
+                traci.vehicle.changeLane(EGO_ID, lane - 1, 0)
 
         elif action == "lane_right":
-            lane = traci.vehicle.getLaneIndex(EGO_ID)
             road = traci.vehicle.getRoadID(EGO_ID)
-            try:
-                n = traci.edge.getLaneNumber(road)
-                if lane < n - 1:
-                    traci.vehicle.changeLane(EGO_ID, lane + 1, 4.0)
-            except Exception:
-                pass
+            if road.startswith(':'):  # on junction — skip
+                return
+            lane = traci.vehicle.getLaneIndex(EGO_ID)
+            n    = traci.edge.getLaneNumber(road)
+            if lane < n - 1:
+                traci.vehicle.changeLane(EGO_ID, lane + 1, 0)
 
         elif action == "autopilot":
-            traci.vehicle.setSpeed(EGO_ID, -1)   # release speed control to SUMO
+            traci.vehicle.setSpeed(EGO_ID, -1)              # release speed to SUMO
+            traci.vehicle.setLaneChangeMode(EGO_ID, 0b00001111)  # restore SUMO auto LC
 
     except traci.exceptions.TraCIException:
         pass
@@ -188,6 +191,8 @@ def _traci_thread() -> None:
         "message": f"Simulation running. Ego car '{EGO_ID}' will appear at its depart time.",
     }))
 
+    ego_seen = False
+
     try:
         while not _sim_stop.is_set() and traci.simulation.getMinExpectedNumber() > 0:
 
@@ -202,6 +207,16 @@ def _traci_thread() -> None:
 
             vehicle_ids = traci.vehicle.getIDList()
             sim_time    = traci.simulation.getTime()
+
+            # When ego car first spawns: disable SUMO auto lane changes so TraCI controls
+            if EGO_ID in vehicle_ids and not ego_seen:
+                ego_seen = True
+                try:
+                    # bits 0-3 = SUMO strategic/cooperative/speed/keepright OFF
+                    # bit 4 (16) + bit 5 (32) = TraCI override + no safety check
+                    traci.vehicle.setLaneChangeMode(EGO_ID, 0b00110000)
+                except Exception:
+                    pass
 
             # Build GeoJSON FeatureCollection
             features = []
