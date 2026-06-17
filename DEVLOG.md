@@ -387,6 +387,158 @@ import {
 
 ---
 
+## 🏗️ Session 4 — 3D Buildings, Camera Follow, Ego Car, TraCI Self-Drive (June 17 2026)
+
+### What was built
+
+#### 1. OSM 3D Buildings — CDN Migration
+- **Problem:** Buildings showed in console (`[Buildings] OSM 3D buildings loaded`) but invisible on map — camera at 45,000m, LOD tiles don't render that far
+- **Root cause of deeper issue:** `vite-plugin-cesium` was bundling Cesium incorrectly → switched to Cesium JS CDN
+- **Fix:**
+  - Added Cesium 1.117 CDN sync script to `frontend/index.html` (before React)
+  - All Cesium symbols destructured from `(window as any).Cesium` at module level
+  - Explicit `Cesium3DTileset.fromIonAssetId(96188)` (Cesium OSM Buildings asset)
+  - `vite.config.ts`: removed cesium plugin, added as external
+  - `flyToBuildingView()` helper: auto-flies to 1200m altitude when Buildings toggled on
+  - New Cesium Ion token with "3d map data" audience
+- **Key lesson:** OSM 3D Tile LOD requires camera < ~2000m altitude
+
+#### 2. Layer Defaults + UI Cleanup
+- All layer defaults → `false` in `layerStore.ts`
+- Removed "3D Buildings" section from RightPanel (duplicate control removed)
+- Buildings layer in left pane is now sole control
+- Area deselect → roads + buildings for that area cleared (per-area `Map<string, Entity[]>` tracking)
+- Removed blue BDTOPO polygon overlays (were rendering on top of OSM 3D buildings)
+
+#### 3. Car Follow Camera System
+Three modes implemented in `CesiumViewer.tsx`:
+
+| Button | Mode | Behavior |
+|---|---|---|
+| ⬆ Top | `top` | 250m above, -90° straight down, car centered |
+| 🚗 Follow | `front` | 100m behind, 100m above, -45° angle |
+| 🚘 Drive | `cockpit` | Inside car, 1.5m above, 2m forward, -3° pitch |
+
+**Critical bug fixed — black screen:**
+- `camera.lookAt(pos, HeadingPitchRange)` locks Cesium's internal camera transform → tiles stop loading → black screen
+- **Fix:** `camera.setView()` instead — repositions without locking
+- `scene.postRender` instead of `scene.preRender`
+
+**Free-rotate follow:**
+- Top/Follow modes: only translate camera by car's delta movement each frame
+- User can freely rotate/zoom while camera tracks car position
+- Mode switch re-initializes angle via `startFollowRef`
+
+**Cockpit mode:**
+- `setView` every frame (locks inside car by design)
+- Car model hidden in cockpit (`entity.model.show = false`)
+- Restored on mode switch or Stop
+
+**Click any car → auto-follow starts**
+
+#### 4. Ego Car (f_0.0) Auto-Detection
+- **ID:** `f_0.0`, **Type:** `EgoCar`, **Depart:** t=10s (route via Bordeaux center)
+- When `f_0.0` appears in SUMO data → automatic camera follow + gold color + 1.3× scale
+- **EGO CAR ACTIVE** banner at top center with amber pulse
+- Ego car disappears → follow stops, banner clears
+- `egoFollowedRef` prevents re-triggering on same simulation run
+
+#### 5. TraCI Self-Drive — sumo_live_server.py Rewrite
+**Complete rewrite** from FCD file-watch → TraCI thread:
+
+```
+Frontend keyboard → WebSocket → Python threading.Queue → TraCI → SUMO
+SUMO positions → TraCI → asyncio.Queue → WebSocket → Frontend
+```
+
+**Architecture:**
+- `_traci_thread()` runs in background thread, calls `traci.simulationStep()` in loop
+- `_cmd_queue` (threading.Queue): WS handler → TraCI thread (control commands)
+- `_pos_queue` (asyncio.Queue): TraCI thread → broadcaster coroutine
+- `asyncio.run_coroutine_threadsafe()` bridges threads safely
+
+**WebSocket protocol:**
+- IN: `{type:'control', action:'set_speed', value:50}` | `brake` | `lane_left` | `lane_right` | `autopilot`
+- OUT: GeoJSON FeatureCollection (positions) + `{type:'ego_state', speed, maxSpeed, lane, road}`
+
+**Keyboard controls (active when ego car visible):**
+
+| Key | Action |
+|---|---|
+| W / ↑ | +5 km/h |
+| S / ↓ | Brake |
+| A / ← | Lane change left |
+| D / → | Lane change right |
+| R | Release to SUMO autopilot |
+| Space | Full stop (0 km/h) |
+
+**Ego HUD** (top center when ego active): live speed, lane number, key hints
+
+#### 6. Lane Change Bug Fix
+- **Bug:** Lane change silently failing
+- **Cause 1:** Junction roads (`:edgeID`) → `traci.edge.getLaneNumber()` throws → exception caught silently
+- **Cause 2:** `changeLane(id, lane, 4.0)` — 4 second duration, too slow
+- **Cause 3:** SUMO's auto lane-change was overriding TraCI commands
+- **Fix:**
+  - Added `if road.startswith(':': return` (skip junctions)
+  - Duration `4.0` → `0` (immediate)
+  - `setLaneChangeMode(EGO_ID, 0b00110000)` on ego spawn: TraCI overrides SUMO
+  - `setLaneChangeMode(EGO_ID, 0b00001111)` on R: restore SUMO auto lane changes
+
+#### 7. 16-Config Vehicle Diversity System
+Hash vehicle ID → deterministic visual config (same vehicle always looks same):
+
+```typescript
+function idHash(id: string): number {
+  let h = 2166136261
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i); h = (h * 16777619) >>> 0
+  }
+  return h
+}
+```
+
+**16 configs across 4 categories:**
+- **Mini** (ferrari.glb, 0.60×): red / orange / yellow / green
+- **Sedan** Toyota/Honda/Tesla (ferrari.glb, 0.88×): pearl white / silver / black / navy
+- **SUV/4×4** (truck.glb, 0.62×): dark / dark red / forest green / silver
+- **Van/MPV** (CesiumMilkTruck.glb, 0.85×): white / yellow / purple / sky blue
+- **Bus** → bus.glb, green
+- **Truck** → truck.glb, orange, 1.55× scale
+- **Motorcycle** → ferrari.glb, purple, 0.45× scale
+- **Ego car** → ferrari.glb, gold, always
+
+### Startup (3 terminals)
+```bash
+# Terminal 1 — TraCI server (replaces old FCD server)
+cd simulations/sumo
+python sumo_live_server.py   # requires SUMO_HOME + pip install traci
+
+# Terminal 2 — Frontend
+cd frontend && npm run dev
+
+# Browser: Click Live SUMO → SUMO-GUI opens automatically → play starts
+# Ego car f_0.0 appears → gold car → auto-camera follow → W/S/A/D to drive
+```
+
+### GitHub Commits This Session
+```
+d4cc379  feat: 16 distinct vehicle configs — mini/sedan/SUV/van with unique colors
+c6d78b9  feat: cockpit/drive view — first-person camera inside ego car
+1e69d62  chore: update SUMO scenario files with ego car route
+7d0b83e  fix: ego car lane change — junction check, immediate duration, laneChangeMode
+e542523  feat: TraCI self-drive — ego car keyboard control (W/S/A/D/R/Space)
+cfd8dae  feat: ego car auto-detection and camera follow
+20c3a36  feat: free-rotate camera follow — delta position only, orientation unlocked
+cb38ad7  fix: follow camera 100m behind, 100m above
+621da24  fix: follow camera pitch -47°
+9b3edb1  fix: adjust follow camera distances
+c1723b3  fix: car follow camera centering for top and follow views
+8258b00  fix: car follow camera black screen (lookAt → setView + postRender)
+```
+
+---
+
 ## 📚 Reference
 
 - **Original Bordeaux index.html repo:** https://github.com/Muhammadusmanmalik701/Cesium-Sumo-digital-twin-road-network
