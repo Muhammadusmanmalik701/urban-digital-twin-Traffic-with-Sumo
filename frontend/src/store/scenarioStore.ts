@@ -17,8 +17,35 @@ interface ScenarioState {
   addScenario: (s: Scenario) => void
 }
 
+const DEMO_SCENARIOS: Scenario[] = [
+  {
+    id: 1, scenario_type: 'TRAFFIC', scenario_code: 'T01',
+    name: 'Traffic Gridlock — Pont de Pierre',
+    description: 'Severe congestion on main bridge. 2.3× normal volume.',
+    severity: 'HIGH', status: 'active', auto_detected: true,
+    affected_zone_ids: [1, 2], kpi_snapshot: {}, created_by: 'system',
+    started_at: new Date().toISOString(),
+  },
+  {
+    id: 2, scenario_type: 'ENERGY', scenario_code: 'E01',
+    name: 'Energy Demand Spike — Industrial Zone',
+    description: 'Grid load at 94%. Risk of cascading failure.',
+    severity: 'CRITICAL', status: 'active', auto_detected: true,
+    affected_zone_ids: [3], kpi_snapshot: {}, created_by: 'system',
+    started_at: new Date().toISOString(),
+  },
+  {
+    id: 3, scenario_type: 'CLIMATE', scenario_code: 'C01',
+    name: 'Heat Wave Alert — Urban Core',
+    description: 'Temp forecast 41°C. Cooling centers at capacity.',
+    severity: 'MEDIUM', status: 'monitoring', auto_detected: true,
+    affected_zone_ids: [1], kpi_snapshot: {}, created_by: 'system',
+    started_at: new Date().toISOString(),
+  },
+]
+
 export const useScenarioStore = create<ScenarioState>((set) => ({
-  activeScenarios: [],
+  activeScenarios: DEMO_SCENARIOS,
   selectedScenario: null,
   solutions: [],
   impactReport: null,

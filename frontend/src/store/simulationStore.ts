@@ -17,14 +17,25 @@ interface SimulationState {
   setLastUpdate: (t: string) => void
 }
 
+const DEMO_KPIS: CityKPIs = {
+  vehicle_count: 1247,
+  energy_mwh: 823,
+  outdoor_temp_c: 28.4,
+  aqi: 87,
+  grid_load_pct: 71,
+  active_incidents: 2,
+  co2_kg_hr: 4820,
+  active_scenarios: 2,
+}
+
 export const useSimulationStore = create<SimulationState>((set) => ({
   vehicles: [],
   zoneCongestion: [],
   signals: [],
-  kpis: null,
+  kpis: DEMO_KPIS,
   climate: null,
   isConnected: false,
-  lastUpdate: null,
+  lastUpdate: new Date().toISOString(),
   setVehicles: (vehicles) => set({ vehicles }),
   setZoneCongestion: (zoneCongestion) => set({ zoneCongestion }),
   setKPIs: (kpis) => set({ kpis }),
