@@ -15,13 +15,13 @@ interface LayerState {
 }
 
 export const useLayerStore = create<LayerState>((set) => ({
-  showTraffic: true,
-  showBuildings: true,
-  showEnergy: true,
+  showTraffic: false,
+  showBuildings: false,
+  showEnergy: false,
   showHeatWave: false,
   showAirQuality: false,
-  showMLPredictions: true,
-  showScenarios: true,
+  showMLPredictions: false,
+  showScenarios: false,
   showFloodRisk: false,
   showGrid: false,
   toggleLayer: (layer) => set((state) => ({ [layer]: !state[layer] })),

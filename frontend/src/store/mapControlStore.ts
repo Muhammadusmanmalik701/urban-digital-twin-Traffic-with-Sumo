@@ -10,8 +10,6 @@ interface MapControlState {
   roadCount: number
   loadingRoads: boolean
   loadProgress: string
-  showOsmBuildings: boolean
-  buildingsLoading: boolean
 
   toggleArea: (area: string) => void
   flyToArea: (area: string) => void
@@ -20,8 +18,6 @@ interface MapControlState {
   setRoadCount: (n: number) => void
   setLoadingRoads: (v: boolean) => void
   setLoadProgress: (s: string) => void
-  toggleOsmBuildings: () => void
-  setBuildingsLoading: (v: boolean) => void
 }
 
 export const useMapControlStore = create<MapControlState>((set) => ({
@@ -32,8 +28,6 @@ export const useMapControlStore = create<MapControlState>((set) => ({
   roadCount: 0,
   loadingRoads: false,
   loadProgress: '',
-  showOsmBuildings: false,
-  buildingsLoading: false,
 
   toggleArea: (area) =>
     set((s) => ({
@@ -51,6 +45,4 @@ export const useMapControlStore = create<MapControlState>((set) => ({
   setRoadCount: (roadCount) => set({ roadCount }),
   setLoadingRoads: (loadingRoads) => set({ loadingRoads }),
   setLoadProgress: (loadProgress) => set({ loadProgress }),
-  toggleOsmBuildings: () => set((s) => ({ showOsmBuildings: !s.showOsmBuildings })),
-  setBuildingsLoading: (buildingsLoading) => set({ buildingsLoading }),
 }))

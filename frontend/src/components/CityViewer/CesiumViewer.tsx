@@ -213,7 +213,7 @@ export function CesiumViewer() {
   const viewerRef       = useRef<HTMLDivElement>(null)
   const cesiumViewer    = useRef<any>(null)
   const vehicleEntities = useRef<Map<string, any>>(new Map())
-  const roadEntities    = useRef<any[]>([])
+  const roadEntities    = useRef<Map<string, any[]>>(new Map())
   const osmBuildings    = useRef<any>(null)
   const areaMarkers     = useRef<Map<string, any>>(new Map())
   const sumoDS          = useRef<any>(null)
@@ -247,7 +247,6 @@ export function CesiumViewer() {
     flyTarget, loadTrigger, roadFilter, selectedAreas,
     toggleArea, flyToArea,
     setRoadCount, setLoadingRoads, setLoadProgress,
-    showOsmBuildings, setBuildingsLoading,
   } = useMapControlStore()
 
   // ── Init Cesium (cancelled flag → no React StrictMode double-init) ─────────
@@ -504,8 +503,9 @@ export function CesiumViewer() {
 
     const load = async () => {
       setLoadingRoads(true); setRoadCount(0)
-      roadEntities.current.forEach((e) => viewer.entities.remove(e))
-      roadEntities.current = []
+      // Clear all existing road entities
+      roadEntities.current.forEach(list => list.forEach(e => viewer.entities.remove(e)))
+      roadEntities.current.clear()
       let total = 0
 
       for (let i = 0; i < selectedAreas.length; i++) {
@@ -516,6 +516,7 @@ export function CesiumViewer() {
         try {
           const data = await fetchAreaData(area.osmName)
           const filter = useMapControlStore.getState().roadFilter
+          const areaRoads: any[] = []
           data.elements.forEach((el: any) => {
             if (el.type !== 'way' || !el.geometry?.length || el.geometry.length < 2) return
             const tags = el.tags || {}
@@ -533,9 +534,10 @@ export function CesiumViewer() {
               },
             })
             roadTypeMap.set(entity, rtype)
-            roadEntities.current.push(entity)
+            areaRoads.push(entity)
             total++
           })
+          roadEntities.current.set(key, areaRoads)
           setRoadCount(total)
         } catch (e) { console.error(`[Roads] Failed for ${key}:`, e) }
       }
@@ -561,8 +563,22 @@ export function CesiumViewer() {
     const viewer = cesiumViewer.current
     if (!viewer) return
 
-    areaEntities.current.forEach(list => list.forEach(e => viewer.entities.remove(e)))
-    areaEntities.current.clear()
+    // Remove entities only for areas no longer selected
+    areaEntities.current.forEach((list, key) => {
+      if (!selectedAreas.includes(key)) {
+        list.forEach(e => viewer.entities.remove(e))
+        areaEntities.current.delete(key)
+      }
+    })
+    // Remove road entities for deselected areas
+    roadEntities.current.forEach((list, key) => {
+      if (!selectedAreas.includes(key)) {
+        list.forEach(e => viewer.entities.remove(e))
+        roadEntities.current.delete(key)
+      }
+    })
+    const remaining = Array.from(roadEntities.current.values()).reduce((s, l) => s + l.length, 0)
+    setRoadCount(remaining)
     if (!selectedAreas.length) return
 
     const BLDG_COLOR   = new Color(147/255, 197/255, 253/255, 0.20)
@@ -661,45 +677,35 @@ export function CesiumViewer() {
     return () => { cancelled = true }
   }, [selectedAreas.join(','), viewerReady])
 
-  // ── OSM 3D Buildings toggle ─────────────────────────────────────────────────
+  // ── OSM 3D Buildings (driven by left panel "Buildings" layer toggle) ──────────
   useEffect(() => {
     const viewer = cesiumViewer.current
     if (!viewer || !viewerReady) return
 
     if (osmBuildings.current && !osmBuildings.current.isDestroyed()) {
-      // Pre-loaded at startup — just flip show
-      osmBuildings.current.show = showOsmBuildings
-      if (showOsmBuildings) flyToBuildingView(viewer)
-    } else if (showOsmBuildings) {
-      // Fallback: pre-load not yet done, load now
-      setBuildingsLoading(true)
+      osmBuildings.current.show = showBuildings
+      if (showBuildings) flyToBuildingView(viewer)
+    } else if (showBuildings) {
+      // Pre-load not yet done — load now
       Cesium3DTileset.fromIonAssetId(96188)
         .then((b: any) => {
           if (!cesiumViewer.current || cesiumViewer.current.isDestroyed()) { b.destroy(); return }
           osmBuildings.current = cesiumViewer.current.scene.primitives.add(b)
           flyToBuildingView(cesiumViewer.current)
-          console.log('[Buildings] OSM loaded via fallback (asset 96188)')
         })
-        .catch((e: any) => console.error('[Buildings] Fallback FAILED:', e))
-        .finally(() => setBuildingsLoading(false))
+        .catch((e: any) => console.error('[Buildings] Load failed:', e))
     }
-  }, [showOsmBuildings, viewerReady])
+    // BDTOPO polygon buildings
+    buildingPolygons.current.forEach(e => { if (e.polygon) e.polygon.show = showBuildings })
+  }, [showBuildings, viewerReady])
 
   // ── Road filter visibility ──────────────────────────────────────────────────
   useEffect(() => {
-    roadEntities.current.forEach((e) => {
+    roadEntities.current.forEach(list => list.forEach(e => {
       const rtype = roadTypeMap.get(e)
       if (e.polyline && rtype) e.polyline.show = roadFilter[rtype]
-    })
+    }))
   }, [roadFilter])
-
-  // ── Buildings visibility (both Ion tileset + OSM polygons) ──────────────────
-  useEffect(() => {
-    // Ion tileset (if loaded)
-    if (osmBuildings.current) osmBuildings.current.show = showBuildings
-    // OSM polygon buildings
-    buildingPolygons.current.forEach(e => { if (e.polygon) e.polygon.show = showBuildings })
-  }, [showBuildings])
 
   // ── Area marker highlight ───────────────────────────────────────────────────
   useEffect(() => {
@@ -832,6 +838,21 @@ export function CesiumViewer() {
   const connectLive = useCallback(() => {
     const viewer = cesiumViewer.current
     if (!viewer) return
+
+    // Gentle zoom-out effect — stay at current location, rise 50m
+    const cam = viewer.camera
+    const pos = cam.positionCartographic
+    if (pos) {
+      viewer.camera.flyTo({
+        destination: Cartesian3.fromDegrees(
+          CesiumMath.toDegrees(pos.longitude),
+          CesiumMath.toDegrees(pos.latitude),
+          pos.height + 50
+        ),
+        orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll },
+        duration: 1.0,
+      })
+    }
 
     setLiveState('connecting')
     setLiveMsg('Connecting to SUMO live server…')
