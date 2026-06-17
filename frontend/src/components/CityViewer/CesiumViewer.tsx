@@ -32,8 +32,7 @@ const {
   HeadingPitchRoll,
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
-  HeadingPitchRange,
-  Matrix4,
+  Cartographic,
 } = (window as any).Cesium
 import { useSimulationStore } from '../../store/simulationStore'
 import { useBuildingStore } from '../../store/buildingStore'
@@ -261,8 +260,7 @@ export function CesiumViewer() {
   const stopFollow = useCallback(() => {
     const viewer = cesiumViewer.current
     if (preRenderListenerRef.current && viewer) {
-      viewer.scene.preRender.removeEventListener(preRenderListenerRef.current)
-      viewer.camera.lookAtTransform(Matrix4.IDENTITY)
+      viewer.scene.postRender.removeEventListener(preRenderListenerRef.current)
     }
     preRenderListenerRef.current = null
     followEntityRef.current = null
@@ -275,8 +273,7 @@ export function CesiumViewer() {
 
     // Clear previous follow
     if (preRenderListenerRef.current) {
-      viewer.scene.preRender.removeEventListener(preRenderListenerRef.current)
-      viewer.camera.lookAtTransform(Matrix4.IDENTITY)
+      viewer.scene.postRender.removeEventListener(preRenderListenerRef.current)
     }
 
     followEntityRef.current = entity
@@ -288,17 +285,36 @@ export function CesiumViewer() {
       if (!v || !ent) return
       const pos = ent.position?.getValue(v.clock.currentTime)
       if (!pos) return
+
+      // Convert Cartesian3 → lon/lat/alt
+      const carto = Cartographic.fromCartesian(pos)
+      if (!carto) return
+      const lon = CesiumMath.toDegrees(carto.longitude)
+      const lat = CesiumMath.toDegrees(carto.latitude)
+      const alt = carto.height ?? 0
+
       const angleDeg = vehicleAngleMap.get(ent) ?? 0
-      const heading = CesiumMath.toRadians(angleDeg + 90)
+      const heading  = CesiumMath.toRadians(angleDeg + 90)
+
       if (followModeRef.current === 'top') {
-        v.camera.lookAt(pos, new HeadingPitchRange(heading, CesiumMath.toRadians(-88), 60))
+        // Bird's eye: 120m above, looking down at -70°
+        v.camera.setView({
+          destination: Cartesian3.fromDegrees(lon, lat, alt + 120),
+          orientation: { heading, pitch: CesiumMath.toRadians(-70), roll: 0 },
+        })
       } else {
-        // Front/follow: behind the car, slightly above
-        v.camera.lookAt(pos, new HeadingPitchRange(heading + Math.PI, CesiumMath.toRadians(-18), 28))
+        // Follow/front: position camera behind the car
+        const behindDist = 0.00035  // ~35m in degrees
+        const behindLon = lon - Math.sin(CesiumMath.toRadians(angleDeg)) * behindDist
+        const behindLat = lat - Math.cos(CesiumMath.toRadians(angleDeg)) * behindDist
+        v.camera.setView({
+          destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 20),
+          orientation: { heading, pitch: CesiumMath.toRadians(-15), roll: 0 },
+        })
       }
     }
 
-    viewer.scene.preRender.addEventListener(listener)
+    viewer.scene.postRender.addEventListener(listener)
     preRenderListenerRef.current = listener
     setFollowInfo({ active: true, mode })
   }, [])
@@ -534,7 +550,7 @@ export function CesiumViewer() {
       hoverHandlerRef.current?.destroy()
       hoverHandlerRef.current = null
       if (preRenderListenerRef.current && lv) {
-        lv.scene.preRender.removeEventListener(preRenderListenerRef.current)
+        lv.scene.postRender.removeEventListener(preRenderListenerRef.current)
         preRenderListenerRef.current = null
       }
       if (lv) { lv.destroy(); lv = null }
