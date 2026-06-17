@@ -308,7 +308,7 @@ export function CesiumViewer() {
         const behindLon = lon - Math.sin(CesiumMath.toRadians(angleDeg)) * behindDist
         const behindLat = lat - Math.cos(CesiumMath.toRadians(angleDeg)) * behindDist
         v.camera.setView({
-          destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 50),
+          destination: Cartesian3.fromDegrees(behindLon, behindLat, alt + 100),
           orientation: { heading, pitch: CesiumMath.toRadians(-47), roll: 0 },
         })
       }
