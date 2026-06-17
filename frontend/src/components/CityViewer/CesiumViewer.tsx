@@ -223,7 +223,6 @@ export function CesiumViewer() {
   const liveEntities    = useRef<Map<string, any>>(new Map())
   const liveEpoch       = useRef<any>(null)
   // OSM building polygon entities (from road-load trigger)
-  const buildingPolygons = useRef<any[]>([])
   // Per-area boundary + buildings (from area-select trigger)
   const areaEntities        = useRef<Map<string, any[]>>(new Map())
   // Hover boundary entities (pre-fetched, hidden by default)
@@ -581,8 +580,6 @@ export function CesiumViewer() {
     setRoadCount(remaining)
     if (!selectedAreas.length) return
 
-    const BLDG_COLOR   = new Color(147/255, 197/255, 253/255, 0.20)
-    const BLDG_OUTLINE = new Color(59/255,  130/255, 246/255, 0.50)
     const DASH_COLOR   = Color.fromCssColorString('#ef4444')
 
     let cancelled = false
@@ -617,60 +614,6 @@ export function CesiumViewer() {
           console.warn(`[Boundary] Failed for ${key}:`, err)
         }
 
-        // ── 2. Buildings (local file → BDTOPO WFS fallback) ──────────────────
-        try {
-          const bldgData = await fetchBuildings(area.osmName)
-          if (cancelled) break
-
-          const isBDTOPO = !!bldgData.features  // GeoJSON FeatureCollection
-          const feats = isBDTOPO
-            ? bldgData.features
-            : (bldgData.elements ?? []).filter((el: any) => el.type === 'way' && el.tags?.building)
-
-          feats.forEach((feat: any) => {
-            try {
-              let coords: any[]
-              let h: number
-
-              if (isBDTOPO) {
-                // GeoJSON from local file or BDTOPO WFS
-                h = feat.properties?.height ?? 9.6
-                const geom = feat.geometry
-                if (!geom || !['Polygon','MultiPolygon'].includes(geom.type)) return
-                const ring = geom.type === 'MultiPolygon'
-                  ? geom.coordinates[0][0]
-                  : geom.coordinates[0]
-                if (!ring || ring.length < 3) return
-                coords = ring.map(([lon, lat]: [number,number]) => Cartesian3.fromDegrees(lon, lat))
-              } else {
-                // Overpass fallback (should rarely trigger now)
-                if (!feat.geometry || feat.geometry.length < 3) return
-                const tags = feat.tags ?? {}
-                const lvl = parseFloat(tags['building:levels'] ?? tags['levels'] ?? '3')
-                h = isNaN(lvl) ? 9.6 : Math.max(lvl, 1) * 3.2
-                coords = feat.geometry.map((n: any) => Cartesian3.fromDegrees(n.lon, n.lat))
-              }
-
-              const e = viewer.entities.add({
-                polygon: {
-                  hierarchy: new PolygonHierarchy(coords),
-                  height: 0,
-                  heightReference: HeightReference.CLAMP_TO_GROUND,
-                  extrudedHeight: h,
-                  extrudedHeightReference: HeightReference.RELATIVE_TO_GROUND,
-                  material: BLDG_COLOR,
-                  outline: true,
-                  outlineColor: BLDG_OUTLINE,
-                  outlineWidth: 1,
-                },
-              })
-              list.push(e)
-            } catch { /* skip malformed */ }
-          })
-        } catch (err) {
-          console.warn(`[Buildings] Failed for ${key}:`, err)
-        }
-
         areaEntities.current.set(key, list)
       }
     })()
@@ -695,8 +638,6 @@ export function CesiumViewer() {
         })
         .catch((e: any) => console.error('[Buildings] Load failed:', e))
     }
-    // BDTOPO polygon buildings
-    buildingPolygons.current.forEach(e => { if (e.polygon) e.polygon.show = showBuildings })
   }, [showBuildings, viewerReady])
 
   // ── Road filter visibility ──────────────────────────────────────────────────
