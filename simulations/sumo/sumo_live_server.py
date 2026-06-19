@@ -31,6 +31,7 @@ Usage:
 import asyncio
 import json
 import os
+import random
 import queue
 import sys
 import threading
@@ -68,6 +69,7 @@ _pos_queue:  asyncio.Queue | None = None   # TraCI thread → WS broadcast
 _cmd_queue:  queue.Queue = queue.Queue()   # WS handler  → TraCI thread
 _sim_stop    = threading.Event()
 _sim_thread: threading.Thread | None = None
+_ego_free_roam = True   # True = free roam (user drives), False = follow SUMO route (R pressed)
 
 
 # ── SUMO binary finder ────────────────────────────────────────────────────────
@@ -128,11 +130,14 @@ def _apply_control(cmd: dict) -> None:
 
     try:
         if action == "set_speed":
-            # value is km/h; -1 means release to SUMO autopilot
+            global _ego_free_roam
+            _ego_free_roam = True   # user took manual control
             ms = float(value) / 3.6 if float(value) >= 0 else -1.0
             traci.vehicle.setSpeed(EGO_ID, ms)
 
         elif action == "brake":
+            global _ego_free_roam
+            _ego_free_roam = True
             cur = traci.vehicle.getSpeed(EGO_ID)
             traci.vehicle.setSpeed(EGO_ID, max(0.0, cur - 3.0))
 
@@ -154,6 +159,8 @@ def _apply_control(cmd: dict) -> None:
                 traci.vehicle.changeLane(EGO_ID, lane + 1, 0)
 
         elif action == "autopilot":
+            global _ego_free_roam
+            _ego_free_roam = False
             traci.vehicle.setSpeed(EGO_ID, -1)              # release speed to SUMO
             traci.vehicle.setLaneChangeMode(EGO_ID, 0b00001111)  # restore SUMO auto LC
 
@@ -212,9 +219,20 @@ def _traci_thread() -> None:
             if EGO_ID in vehicle_ids and not ego_seen:
                 ego_seen = True
                 try:
-                    # bits 0-3 = SUMO strategic/cooperative/speed/keepright OFF
-                    # bit 4 (16) + bit 5 (32) = TraCI override + no safety check
                     traci.vehicle.setLaneChangeMode(EGO_ID, 0b00110000)
+                except Exception:
+                    pass
+
+            # Free roam: when ego near end of route, pick random new destination
+            if EGO_ID in vehicle_ids and _ego_free_roam:
+                try:
+                    route = traci.vehicle.getRoute(EGO_ID)
+                    idx   = traci.vehicle.getRouteIndex(EGO_ID)
+                    if route and idx >= max(0, len(route) - 3):
+                        road_edges = [e for e in traci.edge.getIDList()
+                                      if not e.startswith(':')]
+                        if road_edges:
+                            traci.vehicle.changeTarget(EGO_ID, random.choice(road_edges))
                 except Exception:
                     pass
 

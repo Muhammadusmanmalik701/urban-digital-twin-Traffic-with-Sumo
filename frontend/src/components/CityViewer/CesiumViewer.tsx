@@ -209,63 +209,66 @@ function idHash(id: string): number {
   return h
 }
 
-// 16 visually distinct passenger-vehicle configs across 4 shapes
-const PASSENGER_CONFIGS: { uri: string; scale: number; maxScale: number; hex: string; blend: number }[] = [
-  // ── Mini cars (small scale, bright) ──────────────────────────────────────
-  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#ef4444', blend: 0.60 }, // red mini
-  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#f97316', blend: 0.60 }, // orange mini
-  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#eab308', blend: 0.60 }, // yellow mini
-  { uri: '/sumo/ferrari.glb', scale: 0.60, maxScale: 12, hex: '#22c55e', blend: 0.60 }, // green mini
+// All passenger configs use ferrari.glb only — verified correct orientation
+// Color variety via HIGHLIGHT blend (preserves tires + model detail)
+// Scale variety simulates Mini / Sedan / SUV / Sports
+const PASSENGER_CONFIGS: { scale: number; maxScale: number; hex: string }[] = [
+  // ── Mini / city car ───────────────────────────────────────────────────────
+  { scale: 0.58, maxScale: 12, hex: '#ef4444' }, // red mini
+  { scale: 0.58, maxScale: 12, hex: '#f97316' }, // orange mini
+  { scale: 0.58, maxScale: 12, hex: '#eab308' }, // yellow mini
+  { scale: 0.58, maxScale: 12, hex: '#22c55e' }, // green mini
 
-  // ── Sedan  (Toyota / Honda / Tesla) ──────────────────────────────────────
-  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#f8fafc', blend: 0.65 }, // pearl white
-  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#94a3b8', blend: 0.55 }, // silver
-  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#0f172a', blend: 0.70 }, // midnight black
-  { uri: '/sumo/ferrari.glb', scale: 0.88, maxScale: 18, hex: '#1d4ed8', blend: 0.60 }, // navy blue
+  // ── Sedan — Toyota / Honda / Tesla ───────────────────────────────────────
+  { scale: 0.82, maxScale: 17, hex: '#f8fafc' }, // pearl white
+  { scale: 0.82, maxScale: 17, hex: '#94a3b8' }, // silver
+  { scale: 0.82, maxScale: 17, hex: '#0f172a' }, // midnight black
+  { scale: 0.82, maxScale: 17, hex: '#1d4ed8' }, // navy blue
 
-  // ── SUV / 4×4 (Chinese, Land Rover class) ────────────────────────────────
-  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#1e293b', blend: 0.65 }, // dark 4x4
-  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#7f1d1d', blend: 0.60 }, // dark red 4x4
-  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#14532d', blend: 0.60 }, // forest green 4x4
-  { uri: '/sumo/truck.glb',   scale: 0.62, maxScale: 14, hex: '#d4d4d4', blend: 0.55 }, // silver SUV
+  // ── SUV / 4×4 — Land Rover / Chinese ────────────────────────────────────
+  { scale: 1.05, maxScale: 22, hex: '#1e293b' }, // dark gunmetal
+  { scale: 1.05, maxScale: 22, hex: '#7f1d1d' }, // deep red
+  { scale: 1.05, maxScale: 22, hex: '#14532d' }, // forest green
+  { scale: 1.05, maxScale: 22, hex: '#e2e8f0' }, // pearl SUV
 
-  // ── Van / MPV ─────────────────────────────────────────────────────────────
-  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#e2e8f0', blend: 0.55 }, // white van
-  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#fbbf24', blend: 0.60 }, // yellow van
-  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#6366f1', blend: 0.60 }, // purple van
-  { uri: '/sumo/CesiumMilkTruck.glb', scale: 0.85, maxScale: 18, hex: '#0ea5e9', blend: 0.55 }, // sky blue van
+  // ── Sports / coupe ────────────────────────────────────────────────────────
+  { scale: 0.72, maxScale: 15, hex: '#dc2626' }, // racing red
+  { scale: 0.72, maxScale: 15, hex: '#7c3aed' }, // purple sports
+  { scale: 0.72, maxScale: 15, hex: '#0284c7' }, // sky blue sports
+  { scale: 0.72, maxScale: 15, hex: '#d97706' }, // amber sports
 ]
 
 function getVehicleModel(vtype: string, vehicleId: string): VehicleModel {
   const t = (vtype || '').toLowerCase()
 
-  // Ego car — stays gold (handled at call site, but guard here too)
+  // Ego car — gold highlight
   if (vehicleId === 'f_0.0')
-    return { uri: '/sumo/ferrari.glb', scale: 1.0, maxScale: 20, color: Color.fromCssColorString('#fbbf24'), blendAmount: 0.75 }
+    return { uri: '/sumo/ferrari.glb', scale: 1.0, maxScale: 20,
+             color: Color.fromCssColorString('#fbbf24'), blendAmount: 0.55 }
 
-  // Bus / coach
-  if (t.includes('bus') || t.includes('coach') || t.includes('transit'))
-    return { uri: '/sumo/bus.glb', scale: 1.4, maxScale: 40,
-             color: Color.fromCssColorString('#34d399'), blendAmount: 0.50 }
-
-  // Heavy truck / trailer
-  if (t.includes('truck') || t.includes('trailer') || t.includes('heavy') || t.includes('delivery') || t.includes('hgv'))
-    return { uri: '/sumo/truck.glb', scale: 1.55, maxScale: 32,
-             color: Color.fromCssColorString('#f97316'), blendAmount: 0.45 }
-
-  // Motorcycle / bicycle
+  // Motorcycle / bicycle — very small
   if (t.includes('moto') || t.includes('bicycle') || t.includes('bike') || t.includes('scooter'))
-    return { uri: '/sumo/ferrari.glb', scale: 0.45, maxScale: 9,
-             color: Color.fromCssColorString('#a78bfa'), blendAmount: 0.65 }
+    return { uri: '/sumo/ferrari.glb', scale: 0.42, maxScale: 9,
+             color: Color.fromCssColorString('#a78bfa'), blendAmount: 0.35 }
 
-  // All passenger types — pick config from hash of vehicle ID
+  // Bus / coach — use ferrari.glb large scale until bus.glb orientation verified
+  if (t.includes('bus') || t.includes('coach') || t.includes('transit'))
+    return { uri: '/sumo/ferrari.glb', scale: 1.8, maxScale: 40,
+             color: Color.fromCssColorString('#34d399'), blendAmount: 0.40 }
+
+  // Heavy truck
+  if (t.includes('truck') || t.includes('trailer') || t.includes('heavy') || t.includes('delivery') || t.includes('hgv'))
+    return { uri: '/sumo/ferrari.glb', scale: 1.5, maxScale: 32,
+             color: Color.fromCssColorString('#f97316'), blendAmount: 0.40 }
+
+  // All other passenger types — hash → consistent config
   const cfg = PASSENGER_CONFIGS[idHash(vehicleId) % PASSENGER_CONFIGS.length]
   return {
-    uri:        cfg.uri,
-    scale:      cfg.scale,
-    maxScale:   cfg.maxScale,
-    color:      Color.fromCssColorString(cfg.hex),
-    blendAmount: cfg.blend,
+    uri:         '/sumo/ferrari.glb',
+    scale:       cfg.scale,
+    maxScale:    cfg.maxScale,
+    color:       Color.fromCssColorString(cfg.hex),
+    blendAmount: 0.35,   // HIGHLIGHT-friendly: low blend keeps tires + detail visible
   }
 }
 
@@ -1139,8 +1142,8 @@ export function CesiumViewer() {
                 color: isEgo
                   ? Color.fromCssColorString('#fbbf24')
                   : (vm.color ?? Color.WHITE),
-                colorBlendMode: ColorBlendMode.MIX,
-                colorBlendAmount: isEgo ? 0.75 : (vm.blendAmount ?? (vm.color ? 0.55 : 0)),
+                colorBlendMode: ColorBlendMode.HIGHLIGHT,
+                colorBlendAmount: vm.blendAmount ?? 0.35,
               },
             })
             vehicleAngleMap.set(e, angle)
