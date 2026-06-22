@@ -122,6 +122,8 @@ async def _broadcaster() -> None:
 
 def _apply_control(cmd: dict) -> None:
     """Apply one control command to ego car via TraCI. Runs in TraCI thread."""
+    global _ego_free_roam
+
     if EGO_ID not in traci.vehicle.getIDList():
         return
 
@@ -130,13 +132,11 @@ def _apply_control(cmd: dict) -> None:
 
     try:
         if action == "set_speed":
-            global _ego_free_roam
             _ego_free_roam = True   # user took manual control
             ms = float(value) / 3.6 if float(value) >= 0 else -1.0
             traci.vehicle.setSpeed(EGO_ID, ms)
 
         elif action == "brake":
-            global _ego_free_roam
             _ego_free_roam = True
             cur = traci.vehicle.getSpeed(EGO_ID)
             traci.vehicle.setSpeed(EGO_ID, max(0.0, cur - 3.0))
@@ -159,7 +159,6 @@ def _apply_control(cmd: dict) -> None:
                 traci.vehicle.changeLane(EGO_ID, lane + 1, 0)
 
         elif action == "autopilot":
-            global _ego_free_roam
             _ego_free_roam = False
             traci.vehicle.setSpeed(EGO_ID, -1)              # release speed to SUMO
             traci.vehicle.setLaneChangeMode(EGO_ID, 0b00001111)  # restore SUMO auto LC
