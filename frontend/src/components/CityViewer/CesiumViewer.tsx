@@ -33,6 +33,7 @@ const {
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
   Cartographic,
+  UrlTemplateImageryProvider,
 } = (window as any).Cesium
 import { useSimulationStore } from '../../store/simulationStore'
 import { useBuildingStore } from '../../store/buildingStore'
@@ -304,6 +305,8 @@ export function CesiumViewer() {
   const tlsQueues           = useRef<Map<string, number>>(new Map())
   const heatmapEntities     = useRef<Map<string, any>>(new Map())
   const showHeatmapRef      = useRef(true)
+  const satelliteLayerRef   = useRef<any>(null)
+  const streetsLayerRef     = useRef<any>(null)
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -320,6 +323,7 @@ export function CesiumViewer() {
   const [tlsSelected, setTlsSelected]           = useState<string | null>(null)
   const [tlsOverrideCount, setTlsOverrideCount] = useState(0)
   const setTlsSelectedRef = useRef<(id: string | null) => void>(() => {})
+  const [mapStyle, setMapStyle]         = useState<'satellite' | 'streets'>('satellite')
   const [showHeatmap, setShowHeatmap]   = useState(true)
   const [trafficStats, setTrafficStats] = useState<{ avg_speed: number; stopped_count: number; vehicle_count: number } | null>(null)
   const [baseline, setBaseline]         = useState<{ avg_speed: number; stopped_count: number } | null>(null)
@@ -621,6 +625,17 @@ export function CesiumViewer() {
             .then((b: any) => setSelectedBuilding(b)).catch(console.error)
         }
       })
+
+      // Save satellite layer ref + add CartoDB Voyager streets layer (hidden initially)
+      satelliteLayerRef.current = lv.imageryLayers.get(0)
+      const streetsProvider = new UrlTemplateImageryProvider({
+        url: 'https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+        credit: '© OpenStreetMap contributors © CARTO',
+        maximumLevel: 19,
+      })
+      const streetsLayer = lv.imageryLayers.addImageryProvider(streetsProvider)
+      streetsLayer.show = false
+      streetsLayerRef.current = streetsLayer
 
       cesiumViewer.current = lv
       setViewerReady(true)
@@ -936,6 +951,13 @@ export function CesiumViewer() {
     })
   }, [showHeatmap])
 
+  // ── Map style switch (satellite ↔ streets) ───────────────────────────────────
+  useEffect(() => {
+    if (!satelliteLayerRef.current || !streetsLayerRef.current) return
+    satelliteLayerRef.current.show = mapStyle === 'satellite'
+    streetsLayerRef.current.show   = mapStyle === 'streets'
+  }, [mapStyle])
+
   // ── Area marker highlight ───────────────────────────────────────────────────
   useEffect(() => {
     areaMarkers.current.forEach((entity, key) => {
@@ -1188,9 +1210,9 @@ export function CesiumViewer() {
         const HALF = 0.0005
         ;(data.cells ?? []).forEach((c: any) => {
           const col =
-            c.density < 0.3 ? Color.fromCssColorString('#22c55e').withAlpha(0.28) :
-            c.density < 0.6 ? Color.fromCssColorString('#f59e0b').withAlpha(0.42) :
-                               Color.fromCssColorString('#ef4444').withAlpha(0.58)
+            c.density < 0.3 ? Color.fromCssColorString('#22c55e').withAlpha(0.50) :
+            c.density < 0.6 ? Color.fromCssColorString('#f59e0b').withAlpha(0.65) :
+                               Color.fromCssColorString('#ef4444').withAlpha(0.80)
           const key = `${c.lon}_${c.lat}`
           const e = v.entities.add({
             polygon: {
@@ -1201,7 +1223,10 @@ export function CesiumViewer() {
                 c.lon - HALF, c.lat + HALF,
               ])),
               material: col,
-              height: 1,
+              height: 2,
+              outline: true,
+              outlineColor: col,
+              outlineWidth: 1,
             },
           })
           heatmapEntities.current.set(key, e)
@@ -1486,14 +1511,26 @@ export function CesiumViewer() {
         </div>
       )}
 
-      {/* ── Live 2D/3D toggle (when live is running) ── */}
+      {/* ── Live 2D/3D + map style toggles (bottom-right when live) ── */}
       {liveState === 'running' && (
-        <button
-          onClick={toggle2D3D}
-          className="absolute bottom-8 right-3 z-10 text-xs px-3 py-1.5 rounded-lg bg-gray-900/90 backdrop-blur border border-white/15 text-gray-300 hover:text-white hover:bg-white/10 transition-all font-semibold"
-        >
-          {sim.is3D ? '🗺️ 2D' : '🌐 3D'}
-        </button>
+        <div className="absolute bottom-8 right-3 z-10 flex flex-col gap-1.5">
+          <button
+            onClick={() => setMapStyle(s => s === 'satellite' ? 'streets' : 'satellite')}
+            className={`text-xs px-3 py-1.5 rounded-lg backdrop-blur border font-semibold transition-all ${
+              mapStyle === 'streets'
+                ? 'bg-blue-500/25 border-blue-400/60 text-blue-300'
+                : 'bg-gray-900/90 border-white/15 text-gray-300 hover:text-white hover:bg-white/10'
+            }`}
+          >
+            {mapStyle === 'satellite' ? '🗺️ Streets' : '🛰️ Satellite'}
+          </button>
+          <button
+            onClick={toggle2D3D}
+            className="text-xs px-3 py-1.5 rounded-lg bg-gray-900/90 backdrop-blur border border-white/15 text-gray-300 hover:text-white hover:bg-white/10 transition-all font-semibold"
+          >
+            {sim.is3D ? '🗺️ 2D' : '🌐 3D'}
+          </button>
+        </div>
       )}
 
       {/* ── Ego car HUD ── */}
