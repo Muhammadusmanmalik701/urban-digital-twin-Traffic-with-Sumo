@@ -12,16 +12,19 @@ Requirements:
 WebSocket messages IN (from browser):
   { "type": "start" }
   { "type": "stop" }
-  { "type": "control", "action": "set_speed", "value": 50 }   # km/h
-  { "type": "control", "action": "brake" }
-  { "type": "control", "action": "lane_left" }
-  { "type": "control", "action": "lane_right" }
-  { "type": "control", "action": "autopilot" }                 # release to SUMO
+  { "type": "control",     "action": "set_speed", "value": 50 }   # km/h
+  { "type": "control",     "action": "brake" }
+  { "type": "control",     "action": "lane_left" }
+  { "type": "control",     "action": "lane_right" }
+  { "type": "control",     "action": "autopilot" }                 # release to SUMO
+  { "type": "tls_control", "tls_id": "n123", "action": "force_green"|"force_red"|"reset" }
 
 WebSocket messages OUT (to browser):
   { "type": "status",          "state": "...", "message": "..." }
   { "type": "FeatureCollection", "simTime": ..., "features": [...] }
   { "type": "ego_state",       "speed": 45.2, "maxSpeed": 50, "lane": 1, "road": "..." }
+  { "type": "tls_list",        "tls": [{"id": "n123", "lon": ..., "lat": ...}, ...] }
+  { "type": "tls_states",      "tls": [{"id": "n123", "phase": "GGrr", "overridden": false}, ...] }
 
 Usage:
   cd simulations/sumo
@@ -69,7 +72,8 @@ _pos_queue:  asyncio.Queue | None = None   # TraCI thread → WS broadcast
 _cmd_queue:  queue.Queue = queue.Queue()   # WS handler  → TraCI thread
 _sim_stop    = threading.Event()
 _sim_thread: threading.Thread | None = None
-_ego_free_roam = True   # True = free roam (user drives), False = follow SUMO route (R pressed)
+_ego_free_roam  = True   # True = free roam (user drives), False = follow SUMO route (R pressed)
+_tls_overrides: dict = {}  # { tls_id: forced_phase_string } — user-locked signals
 
 
 # ── SUMO binary finder ────────────────────────────────────────────────────────
@@ -167,6 +171,30 @@ def _apply_control(cmd: dict) -> None:
         pass
 
 
+# ── Traffic light control ────────────────────────────────────────────────────
+
+def _apply_tls_control(cmd: dict) -> None:
+    """Force or release a traffic signal phase. Runs in TraCI thread."""
+    global _tls_overrides
+    tls_id = cmd.get("tls_id", "")
+    action  = cmd.get("action", "")
+    if not tls_id:
+        return
+    try:
+        if tls_id not in traci.trafficlight.getIDList():
+            return
+        if action == "force_green":
+            n = len(traci.trafficlight.getRedYellowGreenState(tls_id))
+            _tls_overrides[tls_id] = 'G' * n
+        elif action == "force_red":
+            n = len(traci.trafficlight.getRedYellowGreenState(tls_id))
+            _tls_overrides[tls_id] = 'r' * n
+        elif action == "reset":
+            _tls_overrides.pop(tls_id, None)
+    except traci.exceptions.TraCIException:
+        pass
+
+
 # ── TraCI simulation thread ───────────────────────────────────────────────────
 
 def _traci_thread() -> None:
@@ -197,7 +225,21 @@ def _traci_thread() -> None:
         "message": f"Simulation running. Ego car '{EGO_ID}' will appear at its depart time.",
     }))
 
-    ego_seen = False
+    # Send initial traffic light list (positions for map markers)
+    tls_ids = list(traci.trafficlight.getIDList())
+    tls_list = []
+    for tls_id in tls_ids:
+        try:
+            x, y = traci.junction.getPosition(tls_id)
+            lon, lat = traci.simulation.convertGeo(x, y)
+            tls_list.append({"id": tls_id, "lon": round(lon, 6), "lat": round(lat, 6)})
+        except Exception:
+            pass
+    if tls_list:
+        _push(json.dumps({"type": "tls_list", "tls": tls_list}))
+
+    ego_seen  = False
+    step_count = 0
 
     try:
         while not _sim_stop.is_set() and traci.simulation.getMinExpectedNumber() > 0:
@@ -205,11 +247,23 @@ def _traci_thread() -> None:
             # Process pending control commands before stepping
             while not _cmd_queue.empty():
                 try:
-                    _apply_control(_cmd_queue.get_nowait())
+                    cmd = _cmd_queue.get_nowait()
+                    if cmd.get("type") == "tls_control":
+                        _apply_tls_control(cmd)
+                    else:
+                        _apply_control(cmd)
+                except Exception:
+                    pass
+
+            # Apply user-forced signal states
+            for tls_id, forced_state in list(_tls_overrides.items()):
+                try:
+                    traci.trafficlight.setRedYellowGreenState(tls_id, forced_state)
                 except Exception:
                     pass
 
             traci.simulationStep()
+            step_count += 1
 
             vehicle_ids = traci.vehicle.getIDList()
             sim_time    = traci.simulation.getTime()
@@ -265,6 +319,22 @@ def _traci_thread() -> None:
                 "vehicleCount": len(features),
                 "features":     features,
             }))
+
+            # Broadcast traffic light states every 5 steps
+            if step_count % 5 == 0 and tls_ids:
+                tls_states = []
+                for tls_id in tls_ids:
+                    try:
+                        phase = traci.trafficlight.getRedYellowGreenState(tls_id)
+                        tls_states.append({
+                            "id":         tls_id,
+                            "phase":      phase,
+                            "overridden": tls_id in _tls_overrides,
+                        })
+                    except Exception:
+                        pass
+                if tls_states:
+                    _push(json.dumps({"type": "tls_states", "tls": tls_states}))
 
             # Ego car live state (speed, lane, road)
             if EGO_ID in vehicle_ids:
@@ -338,6 +408,9 @@ async def ws_handler(websocket) -> None:
                 }))
 
             elif ctype == "control":
+                _cmd_queue.put(cmd)
+
+            elif ctype == "tls_control":
                 _cmd_queue.put(cmd)
 
     except websockets.exceptions.ConnectionClosedError:

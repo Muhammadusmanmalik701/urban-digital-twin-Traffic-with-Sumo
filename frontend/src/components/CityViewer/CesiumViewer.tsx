@@ -299,6 +299,8 @@ export function CesiumViewer() {
   const startFollowRef      = useRef<(entity: any, mode: 'top' | 'front' | 'cockpit') => void>()
   const lastCarPosRef       = useRef<any>(null)
   const egoFollowedRef      = useRef(false)
+  const tlsEntities         = useRef<Map<string, any>>(new Map())
+  const tlsOverrides        = useRef<Set<string>>(new Set())
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -312,6 +314,9 @@ export function CesiumViewer() {
   const [egoActive, setEgoActive]   = useState(false)
   const [egoState, setEgoState]     = useState<{ speed: number; maxSpeed: number; lane: number; autopilot: boolean }>({ speed: 0, maxSpeed: 50, lane: 0, autopilot: true })
   const egoDesiredSpeedRef          = useRef<number>(0)
+  const [tlsSelected, setTlsSelected]       = useState<string | null>(null)
+  const [tlsOverrideCount, setTlsOverrideCount] = useState(0)
+  const setTlsSelectedRef = useRef<(id: string | null) => void>(() => {})
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
@@ -437,8 +442,22 @@ export function CesiumViewer() {
     setFollowInfo({ active: true, mode })
   }, [])
 
-  // Keep ref in sync so init-effect handler can call it
-  startFollowRef.current = startFollow
+  // Keep refs in sync so init-effect handlers can call latest state setters
+  startFollowRef.current  = startFollow
+  setTlsSelectedRef.current = setTlsSelected
+
+  // ── Traffic signal control ─────────────────────────────────────────────────
+  const sendTlsControl = useCallback((tlsId: string, action: string) => {
+    const ws = liveWS.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ type: 'tls_control', tls_id: tlsId, action }))
+    if (action === 'reset') {
+      tlsOverrides.current.delete(tlsId)
+    } else {
+      tlsOverrides.current.add(tlsId)
+    }
+    setTlsOverrideCount(tlsOverrides.current.size)
+  }, [])
 
   // ── Ego car keyboard controls ─────────────────────────────────────────────
   useEffect(() => {
@@ -574,6 +593,13 @@ export function CesiumViewer() {
           const store = useMapControlStore.getState()
           if (!store.selectedAreas.includes(key)) store.toggleArea(key)
           store.flyToArea(key)
+          lv!.selectedEntity = undefined
+          return
+        }
+        // Traffic signal click
+        if (mtype === 'tls') {
+          const tlsId = sel.properties.tlsId.getValue()
+          setTlsSelectedRef.current(tlsId)
           lv!.selectedEntity = undefined
           return
         }
@@ -1086,6 +1112,54 @@ export function CesiumViewer() {
         return
       }
 
+      // Traffic light list — create signal marker entities on map
+      if (data.type === 'tls_list') {
+        const v = cesiumViewer.current
+        if (!v) return
+        tlsEntities.current.forEach((e) => v.entities.remove(e))
+        tlsEntities.current.clear()
+        ;(data.tls ?? []).forEach((t: any) => {
+          const e = v.entities.add({
+            id: `tls_${t.id}`,
+            position: Cartesian3.fromDegrees(t.lon, t.lat, 3),
+            point: {
+              pixelSize: 10,
+              color: Color.fromCssColorString('#22c55e'),
+              outlineColor: Color.BLACK.withAlpha(0.5),
+              outlineWidth: 1.5,
+              heightReference: HeightReference.CLAMP_TO_GROUND,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              scaleByDistance: new NearFarScalar(50, 2.0, 1500, 0.5),
+            },
+            properties: { markerType: 'tls', tlsId: t.id },
+          })
+          tlsEntities.current.set(t.id, e)
+        })
+        return
+      }
+
+      // Traffic light state updates — recolor signal markers
+      if (data.type === 'tls_states') {
+        ;(data.tls ?? []).forEach((t: any) => {
+          const e = tlsEntities.current.get(t.id)
+          if (!e?.point) return
+          const phase = t.phase ?? ''
+          const g = (phase.match(/[Gg]/g) || []).length
+          const r = (phase.match(/[rR]/g) || []).length
+          const y = (phase.match(/[yY]/g) || []).length
+          const col =
+            y > 0 && y >= g && y >= r ? Color.fromCssColorString('#eab308') :
+            g >= r                     ? Color.fromCssColorString('#22c55e') :
+                                         Color.fromCssColorString('#ef4444')
+          ;(e.point as any).color        = new ConstantProperty(col)
+          ;(e.point as any).outlineColor = new ConstantProperty(
+            t.overridden ? Color.WHITE : Color.BLACK.withAlpha(0.5)
+          )
+          ;(e.point as any).outlineWidth = new ConstantProperty(t.overridden ? 3 : 1.5)
+        })
+        return
+      }
+
       // Vehicle position update: GeoJSON FeatureCollection
       if (data.type === 'FeatureCollection') {
         setLiveState('running')
@@ -1187,10 +1261,15 @@ export function CesiumViewer() {
     liveWS.current = null
     liveEntities.current.forEach((e) => cesiumViewer.current?.entities.remove(e))
     liveEntities.current.clear()
+    tlsEntities.current.forEach((e) => cesiumViewer.current?.entities.remove(e))
+    tlsEntities.current.clear()
+    tlsOverrides.current.clear()
     liveEpoch.current = null
     egoFollowedRef.current = false
     setEgoActive(false)
     stopFollow()
+    setTlsSelected(null)
+    setTlsOverrideCount(0)
     setLiveState('idle')
     setLiveCount(0)
     setLiveSimTime(0)
@@ -1382,6 +1461,48 @@ export function CesiumViewer() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* ── Traffic signal override badge ── */}
+      {liveState === 'running' && tlsOverrideCount > 0 && (
+        <div className="absolute top-16 right-3 z-10 flex items-center gap-2 bg-amber-950/90 backdrop-blur border border-amber-500/40 rounded-xl px-3 py-1.5 text-xs">
+          <span className="text-amber-400 font-bold">
+            🚦 {tlsOverrideCount} signal{tlsOverrideCount > 1 ? 's' : ''} overridden
+          </span>
+          <button
+            onClick={() => {
+              const ids = [...tlsOverrides.current]
+              ids.forEach(id => sendTlsControl(id, 'reset'))
+            }}
+            className="text-gray-500 hover:text-red-400 transition-all font-bold"
+            title="Reset all to auto"
+          >↺</button>
+        </div>
+      )}
+
+      {/* ── Traffic signal control popup ── */}
+      {tlsSelected && liveState === 'running' && (
+        <div className="absolute bottom-28 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-gray-950/95 backdrop-blur-xl border border-white/20 rounded-2xl px-4 py-2.5 shadow-2xl">
+          <span className="text-base">🚦</span>
+          <span className="text-xs text-gray-400 font-mono max-w-[110px] truncate">{tlsSelected}</span>
+          <div className="w-px h-5 bg-white/10" />
+          <button
+            onClick={() => sendTlsControl(tlsSelected, 'force_green')}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-green-500/20 border border-green-500/40 text-green-400 hover:bg-green-500/35 transition-all"
+          >🟢 Green</button>
+          <button
+            onClick={() => sendTlsControl(tlsSelected, 'force_red')}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-red-500/20 border border-red-500/40 text-red-400 hover:bg-red-500/35 transition-all"
+          >🔴 Red</button>
+          <button
+            onClick={() => sendTlsControl(tlsSelected, 'reset')}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-white/8 border border-white/20 text-gray-300 hover:bg-white/15 hover:text-white transition-all"
+          >↺ Auto</button>
+          <button
+            onClick={() => setTlsSelected(null)}
+            className="w-6 h-6 rounded-lg bg-white/5 hover:bg-white/15 text-gray-500 hover:text-white flex items-center justify-center transition-all"
+          >✕</button>
         </div>
       )}
 
