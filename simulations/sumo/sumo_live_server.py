@@ -320,21 +320,63 @@ def _traci_thread() -> None:
                 "features":     features,
             }))
 
-            # Broadcast traffic light states every 5 steps
+            # Broadcast traffic light states + queue lengths every 5 steps
             if step_count % 5 == 0 and tls_ids:
                 tls_states = []
                 for tls_id in tls_ids:
                     try:
                         phase = traci.trafficlight.getRedYellowGreenState(tls_id)
+                        controlled_lanes = set(traci.trafficlight.getControlledLanes(tls_id))
+                        queue = sum(
+                            traci.lane.getLastStepHaltingNumber(lane)
+                            for lane in controlled_lanes
+                        )
                         tls_states.append({
                             "id":         tls_id,
                             "phase":      phase,
                             "overridden": tls_id in _tls_overrides,
+                            "queue":      queue,
                         })
                     except Exception:
                         pass
                 if tls_states:
                     _push(json.dumps({"type": "tls_states", "tls": tls_states}))
+
+            # Heatmap + traffic stats every 10 steps
+            if step_count % 10 == 0 and features:
+                cell_size = 0.001
+                cells: dict = {}
+                speeds_all: list = []
+                stopped = 0
+                for f in features:
+                    lon_f, lat_f = f["geometry"]["coordinates"][:2]
+                    spd = f["properties"]["speed"]
+                    speeds_all.append(spd)
+                    if spd < 3.6:
+                        stopped += 1
+                    col = int(lon_f / cell_size)
+                    row = int(lat_f / cell_size)
+                    cells[(col, row)] = cells.get((col, row), 0) + 1
+
+                cap = min(max(cells.values(), default=1), 10)
+                hm_cells = [
+                    {
+                        "lon":     round((c + 0.5) * cell_size, 6),
+                        "lat":     round((r + 0.5) * cell_size, 6),
+                        "density": round(min(cnt / cap, 1.0), 3),
+                    }
+                    for (c, r), cnt in cells.items()
+                ]
+                _push(json.dumps({"type": "heatmap", "cells": hm_cells}))
+
+                avg_spd = round(sum(speeds_all) / len(speeds_all), 1) if speeds_all else 0.0
+                _push(json.dumps({
+                    "type":          "traffic_stats",
+                    "avg_speed":     avg_spd,
+                    "stopped_count": stopped,
+                    "vehicle_count": len(features),
+                    "sim_time":      sim_time,
+                }))
 
             # Ego car live state (speed, lane, road)
             if EGO_ID in vehicle_ids:

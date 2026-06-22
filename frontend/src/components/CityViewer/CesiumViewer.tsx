@@ -301,6 +301,9 @@ export function CesiumViewer() {
   const egoFollowedRef      = useRef(false)
   const tlsEntities         = useRef<Map<string, any>>(new Map())
   const tlsOverrides        = useRef<Set<string>>(new Set())
+  const tlsQueues           = useRef<Map<string, number>>(new Map())
+  const heatmapEntities     = useRef<Map<string, any>>(new Map())
+  const showHeatmapRef      = useRef(true)
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -314,9 +317,12 @@ export function CesiumViewer() {
   const [egoActive, setEgoActive]   = useState(false)
   const [egoState, setEgoState]     = useState<{ speed: number; maxSpeed: number; lane: number; autopilot: boolean }>({ speed: 0, maxSpeed: 50, lane: 0, autopilot: true })
   const egoDesiredSpeedRef          = useRef<number>(0)
-  const [tlsSelected, setTlsSelected]       = useState<string | null>(null)
+  const [tlsSelected, setTlsSelected]           = useState<string | null>(null)
   const [tlsOverrideCount, setTlsOverrideCount] = useState(0)
   const setTlsSelectedRef = useRef<(id: string | null) => void>(() => {})
+  const [showHeatmap, setShowHeatmap]   = useState(true)
+  const [trafficStats, setTrafficStats] = useState<{ avg_speed: number; stopped_count: number; vehicle_count: number } | null>(null)
+  const [baseline, setBaseline]         = useState<{ avg_speed: number; stopped_count: number } | null>(null)
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
@@ -443,8 +449,9 @@ export function CesiumViewer() {
   }, [])
 
   // Keep refs in sync so init-effect handlers can call latest state setters
-  startFollowRef.current  = startFollow
+  startFollowRef.current    = startFollow
   setTlsSelectedRef.current = setTlsSelected
+  showHeatmapRef.current    = showHeatmap
 
   // ── Traffic signal control ─────────────────────────────────────────────────
   const sendTlsControl = useCallback((tlsId: string, action: string) => {
@@ -922,6 +929,13 @@ export function CesiumViewer() {
     }))
   }, [roadFilter])
 
+  // ── Heatmap visibility toggle ────────────────────────────────────────────────
+  useEffect(() => {
+    heatmapEntities.current.forEach(e => {
+      if (e.polygon) e.polygon.show = showHeatmap
+    })
+  }, [showHeatmap])
+
   // ── Area marker highlight ───────────────────────────────────────────────────
   useEffect(() => {
     areaMarkers.current.forEach((entity, key) => {
@@ -1138,7 +1152,7 @@ export function CesiumViewer() {
         return
       }
 
-      // Traffic light state updates — recolor signal markers
+      // Traffic light state updates — recolor signal markers + queue size
       if (data.type === 'tls_states') {
         ;(data.tls ?? []).forEach((t: any) => {
           const e = tlsEntities.current.get(t.id)
@@ -1156,6 +1170,51 @@ export function CesiumViewer() {
             t.overridden ? Color.WHITE : Color.BLACK.withAlpha(0.5)
           )
           ;(e.point as any).outlineWidth = new ConstantProperty(t.overridden ? 3 : 1.5)
+          // Scale point by queue length (visual congestion indicator)
+          const q = t.queue ?? 0
+          ;(e.point as any).pixelSize = new ConstantProperty(q > 6 ? 16 : q > 2 ? 13 : 10)
+          tlsQueues.current.set(t.id, q)
+        })
+        return
+      }
+
+      // Heatmap — colored grid cells showing vehicle density
+      if (data.type === 'heatmap') {
+        const v = cesiumViewer.current
+        if (!v) return
+        heatmapEntities.current.forEach(e => v.entities.remove(e))
+        heatmapEntities.current.clear()
+        if (!showHeatmapRef.current) return
+        const HALF = 0.0005
+        ;(data.cells ?? []).forEach((c: any) => {
+          const col =
+            c.density < 0.3 ? Color.fromCssColorString('#22c55e').withAlpha(0.28) :
+            c.density < 0.6 ? Color.fromCssColorString('#f59e0b').withAlpha(0.42) :
+                               Color.fromCssColorString('#ef4444').withAlpha(0.58)
+          const key = `${c.lon}_${c.lat}`
+          const e = v.entities.add({
+            polygon: {
+              hierarchy: new PolygonHierarchy(Cartesian3.fromDegreesArray([
+                c.lon - HALF, c.lat - HALF,
+                c.lon + HALF, c.lat - HALF,
+                c.lon + HALF, c.lat + HALF,
+                c.lon - HALF, c.lat + HALF,
+              ])),
+              material: col,
+              height: 1,
+            },
+          })
+          heatmapEntities.current.set(key, e)
+        })
+        return
+      }
+
+      // Traffic stats — avg speed, stopped vehicles
+      if (data.type === 'traffic_stats') {
+        setTrafficStats({
+          avg_speed:     data.avg_speed     ?? 0,
+          stopped_count: data.stopped_count ?? 0,
+          vehicle_count: data.vehicle_count ?? 0,
         })
         return
       }
@@ -1264,12 +1323,17 @@ export function CesiumViewer() {
     tlsEntities.current.forEach((e) => cesiumViewer.current?.entities.remove(e))
     tlsEntities.current.clear()
     tlsOverrides.current.clear()
+    tlsQueues.current.clear()
+    heatmapEntities.current.forEach((e) => cesiumViewer.current?.entities.remove(e))
+    heatmapEntities.current.clear()
     liveEpoch.current = null
     egoFollowedRef.current = false
     setEgoActive(false)
     stopFollow()
     setTlsSelected(null)
     setTlsOverrideCount(0)
+    setTrafficStats(null)
+    setBaseline(null)
     setLiveState('idle')
     setLiveCount(0)
     setLiveSimTime(0)
@@ -1464,6 +1528,81 @@ export function CesiumViewer() {
         </div>
       )}
 
+      {/* ── Traffic analytics panel (bottom-left) ── */}
+      {liveState === 'running' && trafficStats && (
+        <div className="absolute bottom-4 left-4 z-20 bg-gray-950/95 backdrop-blur-xl border border-white/15 rounded-2xl px-4 py-3 shadow-2xl min-w-[260px]">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold text-gray-300 tracking-wide">📊 Traffic Analytics</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setBaseline({ avg_speed: trafficStats.avg_speed, stopped_count: trafficStats.stopped_count })}
+                className="text-xs px-2 py-0.5 rounded-lg bg-blue-500/20 border border-blue-500/40 text-blue-400 hover:bg-blue-500/30 transition-all"
+                title="Save current stats as baseline"
+              >📸 Snapshot</button>
+              {baseline && (
+                <button
+                  onClick={() => setBaseline(null)}
+                  className="w-5 h-5 rounded text-gray-600 hover:text-red-400 transition-all text-xs"
+                >✕</button>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 text-center">
+            {/* Avg Speed */}
+            <div className="bg-white/5 rounded-xl px-2 py-2">
+              <div className="text-gray-500 text-[10px] mb-0.5">AVG SPEED</div>
+              <div className="text-white font-bold text-sm font-mono">{trafficStats.avg_speed.toFixed(0)}</div>
+              <div className="text-gray-600 text-[10px]">km/h</div>
+              {baseline && (() => {
+                const d = trafficStats.avg_speed - baseline.avg_speed
+                return d !== 0 ? (
+                  <div className={`text-[10px] font-bold mt-0.5 ${d > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {d > 0 ? '▲' : '▼'} {Math.abs(d).toFixed(1)}
+                  </div>
+                ) : null
+              })()}
+            </div>
+
+            {/* Stopped */}
+            <div className="bg-white/5 rounded-xl px-2 py-2">
+              <div className="text-gray-500 text-[10px] mb-0.5">STOPPED</div>
+              <div className={`font-bold text-sm font-mono ${trafficStats.stopped_count > 10 ? 'text-red-400' : trafficStats.stopped_count > 3 ? 'text-amber-400' : 'text-green-400'}`}>
+                {trafficStats.stopped_count}
+              </div>
+              <div className="text-gray-600 text-[10px]">vehicles</div>
+              {baseline && (() => {
+                const d = trafficStats.stopped_count - baseline.stopped_count
+                return d !== 0 ? (
+                  <div className={`text-[10px] font-bold mt-0.5 ${d < 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {d > 0 ? '▲' : '▼'} {Math.abs(d)}
+                  </div>
+                ) : null
+              })()}
+            </div>
+
+            {/* Total */}
+            <div className="bg-white/5 rounded-xl px-2 py-2">
+              <div className="text-gray-500 text-[10px] mb-0.5">TOTAL</div>
+              <div className="text-white font-bold text-sm font-mono">{trafficStats.vehicle_count}</div>
+              <div className="text-gray-600 text-[10px]">vehicles</div>
+            </div>
+          </div>
+
+          {/* Heatmap toggle */}
+          <button
+            onClick={() => setShowHeatmap(h => !h)}
+            className={`mt-2 w-full text-xs py-1.5 rounded-lg font-semibold border transition-all flex items-center justify-center gap-1.5 ${
+              showHeatmap
+                ? 'bg-red-500/15 border-red-500/40 text-red-400 hover:bg-red-500/25'
+                : 'bg-white/5 border-white/15 text-gray-400 hover:bg-white/10 hover:text-white'
+            }`}
+          >
+            🌡 Congestion Heatmap {showHeatmap ? 'ON' : 'OFF'}
+          </button>
+        </div>
+      )}
+
       {/* ── Traffic signal override badge ── */}
       {liveState === 'running' && tlsOverrideCount > 0 && (
         <div className="absolute top-16 right-3 z-10 flex items-center gap-2 bg-amber-950/90 backdrop-blur border border-amber-500/40 rounded-xl px-3 py-1.5 text-xs">
@@ -1485,7 +1624,12 @@ export function CesiumViewer() {
       {tlsSelected && liveState === 'running' && (
         <div className="absolute bottom-28 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-gray-950/95 backdrop-blur-xl border border-white/20 rounded-2xl px-4 py-2.5 shadow-2xl">
           <span className="text-base">🚦</span>
-          <span className="text-xs text-gray-400 font-mono max-w-[110px] truncate">{tlsSelected}</span>
+          <span className="text-xs text-gray-400 font-mono max-w-[100px] truncate">{tlsSelected}</span>
+          {(tlsQueues.current.get(tlsSelected) ?? 0) > 0 && (
+            <span className="text-xs font-bold text-red-400 bg-red-500/15 border border-red-500/30 rounded-lg px-1.5 py-0.5">
+              {tlsQueues.current.get(tlsSelected)} waiting
+            </span>
+          )}
           <div className="w-px h-5 bg-white/10" />
           <button
             onClick={() => sendTlsControl(tlsSelected, 'force_green')}
