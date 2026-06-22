@@ -354,8 +354,8 @@ def _traci_thread() -> None:
                     speeds_all.append(spd)
                     if spd < 3.6:
                         stopped += 1
-                    col = int(lon_f / cell_size)
-                    row = int(lat_f / cell_size)
+                    col = int(lon_f // cell_size)   # floor division — correct for negative lon
+                    row = int(lat_f // cell_size)
                     cells[(col, row)] = cells.get((col, row), 0) + 1
 
                 cap = min(max(cells.values(), default=1), 10)
@@ -363,6 +363,7 @@ def _traci_thread() -> None:
                     {
                         "lon":     round((c + 0.5) * cell_size, 6),
                         "lat":     round((r + 0.5) * cell_size, 6),
+                        "count":   cnt,
                         "density": round(min(cnt / cap, 1.0), 3),
                     }
                     for (c, r), cnt in cells.items()

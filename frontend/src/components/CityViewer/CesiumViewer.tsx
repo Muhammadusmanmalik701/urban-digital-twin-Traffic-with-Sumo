@@ -23,7 +23,6 @@ const {
   SampledPositionProperty,
   LinearApproximation,
   ExtrapolationType,
-  PolygonHierarchy,
   JulianDate,
   ClockRange,
   SceneMode,
@@ -1200,33 +1199,28 @@ export function CesiumViewer() {
         return
       }
 
-      // Heatmap — colored grid cells showing vehicle density
+      // Heatmap — large colored point blobs showing vehicle density
+      // Points work reliably in both 2D and 3D mode (unlike polygon entities)
       if (data.type === 'heatmap') {
         const v = cesiumViewer.current
         if (!v) return
         heatmapEntities.current.forEach(e => v.entities.remove(e))
         heatmapEntities.current.clear()
         if (!showHeatmapRef.current) return
-        const HALF = 0.0005
         ;(data.cells ?? []).forEach((c: any) => {
           const col =
-            c.density < 0.3 ? Color.fromCssColorString('#22c55e').withAlpha(0.50) :
-            c.density < 0.6 ? Color.fromCssColorString('#f59e0b').withAlpha(0.65) :
-                               Color.fromCssColorString('#ef4444').withAlpha(0.80)
+            c.density < 0.3 ? Color.fromCssColorString('#22c55e').withAlpha(0.55) :
+            c.density < 0.6 ? Color.fromCssColorString('#f59e0b').withAlpha(0.70) :
+                               Color.fromCssColorString('#ef4444').withAlpha(0.85)
           const key = `${c.lon}_${c.lat}`
           const e = v.entities.add({
-            polygon: {
-              hierarchy: new PolygonHierarchy(Cartesian3.fromDegreesArray([
-                c.lon - HALF, c.lat - HALF,
-                c.lon + HALF, c.lat - HALF,
-                c.lon + HALF, c.lat + HALF,
-                c.lon - HALF, c.lat + HALF,
-              ])),
-              material: col,
-              height: 2,
-              outline: true,
-              outlineColor: col,
-              outlineWidth: 1,
+            position: Cartesian3.fromDegrees(c.lon, c.lat, 5),
+            point: {
+              pixelSize: 68,
+              color: col,
+              heightReference: HeightReference.NONE,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              scaleByDistance: new NearFarScalar(80, 3.0, 3000, 0.5),
             },
           })
           heatmapEntities.current.set(key, e)
