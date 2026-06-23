@@ -168,7 +168,7 @@ docker-compose up --build
 ## 👤 Author
 **Muhammad Usman Malik** — M.Sc. Complex Systems Engineering, University of Bordeaux  
 GitHub: [@Muhammadusmanmalik701](https://github.com/Muhammadusmanmalik701)  
-Email: imsintern26@gmail.com
+Email: muhammadusmanmalik701@gmail.com / mmusmaan1@hotmail.com
 
 ---
 
