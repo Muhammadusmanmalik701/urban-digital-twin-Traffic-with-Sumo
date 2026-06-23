@@ -74,6 +74,10 @@ _sim_stop    = threading.Event()
 _sim_thread: threading.Thread | None = None
 _ego_free_roam  = True   # True = free roam (user drives), False = follow SUMO route (R pressed)
 _tls_overrides: dict = {}  # { tls_id: forced_phase_string } — user-locked signals
+_broken_vehicles: dict = {}  # { veh_id: incident_type } — stopped incident vehicles
+_incident_edges:  set  = set()  # edge IDs blocked by incidents
+_edge_shapes:     dict = {}  # { edge_id: [[lon, lat], ...] } — set once at startup
+_speed_history:   dict = {}  # { edge_id: [spd1, spd2, ...] } — rolling 8-reading window
 
 
 # ── SUMO binary finder ────────────────────────────────────────────────────────
@@ -195,6 +199,144 @@ def _apply_tls_control(cmd: dict) -> None:
         pass
 
 
+# ── Incident scenario control ────────────────────────────────────────────────
+
+def _predict_speed(edge_id: str, current_spd: float) -> float:
+    """Linear extrapolation: predict speed 3 steps ahead using rolling history."""
+    hist = _speed_history.setdefault(edge_id, [])
+    hist.append(current_spd)
+    if len(hist) > 8:
+        hist.pop(0)
+    if len(hist) < 3:
+        return current_spd
+    slope = (hist[-1] - hist[0]) / (len(hist) - 1)
+    return max(0.0, hist[-1] + slope * 3)
+
+
+def _apply_incident(cmd: dict) -> None:
+    """
+    Trigger or clear a vehicle incident.
+    On trigger:
+      1. Freeze vehicle at current position
+      2. Block its edge (infinite travel time → SUMO routes around it)
+      3. Snapshot routes of vehicles that pass through the incident edge
+      4. Reroute all non-incident vehicles
+      5. Diff old vs new routes → extract detour (alternate) edges
+      6. Broadcast incident + alt_routes messages
+    """
+    global _broken_vehicles, _incident_edges
+    veh_id = cmd.get("veh_id", "")
+    itype  = cmd.get("incident_type", "")
+
+    if itype == "clear":
+        edge_id = _broken_vehicles.pop(veh_id + "_edge", "")
+        _broken_vehicles.pop(veh_id, None)
+        if edge_id and edge_id in _incident_edges:
+            try:
+                traci.edge.adaptTraveltime(edge_id, -1)
+            except Exception:
+                pass
+            _incident_edges.discard(edge_id)
+        try:
+            traci.vehicle.remove(veh_id)
+        except Exception:
+            pass
+        _push(json.dumps({"type": "incident_cleared", "veh_id": veh_id}))
+        return
+
+    if veh_id not in traci.vehicle.getIDList():
+        return
+
+    try:
+        x, y     = traci.vehicle.getPosition(veh_id)
+        lon, lat = traci.simulation.convertGeo(x, y)
+        edge_id  = traci.vehicle.getRoadID(veh_id)
+
+        # ── 1. Freeze vehicle ────────────────────────────────────────────────
+        traci.vehicle.setSpeed(veh_id, 0.0)
+        traci.vehicle.setMaxSpeed(veh_id, 0.0)
+        _broken_vehicles[veh_id]           = itype
+        _broken_vehicles[veh_id + "_edge"] = edge_id
+
+        # ── 2. Block edge ────────────────────────────────────────────────────
+        if not edge_id.startswith(':'):
+            traci.edge.adaptTraveltime(edge_id, 1e9)
+            _incident_edges.add(edge_id)
+
+        # ── 3. Snapshot routes of affected vehicles (before rerouting) ───────
+        live_ids = traci.vehicle.getIDList()
+        affected_before: dict = {}   # { vid: set(old_route_edges) }
+        for vid in live_ids:
+            if vid == veh_id or vid in _broken_vehicles:
+                continue
+            try:
+                route = traci.vehicle.getRoute(vid)
+                if edge_id in route:
+                    affected_before[vid] = set(route)
+            except Exception:
+                pass
+
+        # ── 4. Reroute vehicles whose future route passes through the blocked edge.
+        #       Use currentTravelTimes=False so SUMO uses our adaptTraveltime(1e9)
+        #       setting rather than live speeds, guaranteeing the blocked edge is
+        #       treated as impassable.  Only reroute vehicles not yet on the edge.
+        rerouted = 0
+        for vid in live_ids:
+            if vid == veh_id or vid in _broken_vehicles:
+                continue
+            try:
+                route = traci.vehicle.getRoute(vid)
+                ridx  = traci.vehicle.getRouteIndex(vid)
+                if edge_id in route[ridx:]:
+                    traci.vehicle.rerouteTraveltime(vid, currentTravelTimes=False)
+                    rerouted += 1
+            except Exception:
+                pass
+
+        # ── 5. Diff routes → find detour edges (alternate corridors) ─────────
+        from collections import Counter
+        detour_freq: Counter = Counter()
+        for vid, old_edges in affected_before.items():
+            try:
+                new_route = traci.vehicle.getRoute(vid)
+                for eid in new_route:
+                    if eid not in old_edges and not eid.startswith(':') and eid != edge_id:
+                        detour_freq[eid] += 1
+            except Exception:
+                pass
+
+        # Top 30 most-used detour edges (that we have geometry for)
+        alt_edges = [
+            {"id": eid, "coords": _edge_shapes[eid], "usage": cnt}
+            for eid, cnt in detour_freq.most_common(30)
+            if eid in _edge_shapes
+        ]
+
+        # ── 6. Broadcast ─────────────────────────────────────────────────────
+        _push(json.dumps({
+            "type":          "incident",
+            "veh_id":        veh_id,
+            "incident_type": itype,
+            "lon":           round(lon, 6),
+            "lat":           round(lat, 6),
+            "edge_id":       edge_id,
+            "rerouted":      rerouted,
+            "affected":      len(affected_before),
+        }))
+
+        _push(json.dumps({
+            "type":           "alt_routes",
+            "incident_edge":  edge_id,
+            "incident_coords": _edge_shapes.get(edge_id, []),
+            "affected":       len(affected_before),
+            "rerouted":       rerouted,
+            "alt_edges":      alt_edges,
+        }))
+
+    except Exception as e:
+        print(f"[Incident] Error: {e}")
+
+
 # ── TraCI simulation thread ───────────────────────────────────────────────────
 
 def _traci_thread() -> None:
@@ -212,7 +354,14 @@ def _traci_thread() -> None:
     }))
 
     try:
-        traci.start([binary, "-c", cfg, "--start"])
+        traci.start([
+            binary, "-c", cfg, "--start",
+            # Built-in adaptive rerouting: SUMO re-evaluates every vehicle's route
+            # every 30 s using current edge speeds → avoids manual rerouting deadlock
+            "--device.rerouting.period",              "30",
+            "--device.rerouting.adaptation-interval", "10",
+            "--device.rerouting.threads",             "1",
+        ])
     except Exception as e:
         _push(json.dumps({
             "type": "status", "state": "error",
@@ -238,6 +387,25 @@ def _traci_thread() -> None:
     if tls_list:
         _push(json.dumps({"type": "tls_list", "tls": tls_list}))
 
+    # Collect edge geometry once → module-level _edge_shapes for incident analysis
+    global _edge_shapes
+    _edge_shapes.clear()
+    for eid in traci.edge.getIDList():
+        if eid.startswith(':'):   # skip internal junction connectors
+            continue
+        try:
+            shape = traci.edge.getShape(eid)
+            pts   = []
+            for x, y in shape:
+                ln, lt = traci.simulation.convertGeo(x, y)
+                pts.append([round(ln, 6), round(lt, 6)])
+            if len(pts) >= 2:
+                _edge_shapes[eid] = pts
+        except Exception:
+            pass
+    if _edge_shapes:
+        _push(json.dumps({"type": "edge_shapes", "edges": _edge_shapes}))
+
     ego_seen  = False
     step_count = 0
 
@@ -250,6 +418,8 @@ def _traci_thread() -> None:
                     cmd = _cmd_queue.get_nowait()
                     if cmd.get("type") == "tls_control":
                         _apply_tls_control(cmd)
+                    elif cmd.get("type") == "incident":
+                        _apply_incident(cmd)
                     else:
                         _apply_control(cmd)
                 except Exception:
@@ -261,6 +431,44 @@ def _traci_thread() -> None:
                     traci.trafficlight.setRedYellowGreenState(tls_id, forced_state)
                 except Exception:
                     pass
+
+            # Keep incident vehicles frozen (SUMO resets speed each step)
+            live_ids = traci.vehicle.getIDList()
+            for bvid in list(_broken_vehicles.keys()):
+                if bvid.endswith('_edge'):
+                    continue
+                if bvid in live_ids:
+                    try:
+                        traci.vehicle.setSpeed(bvid, 0.0)
+                        traci.vehicle.setMaxSpeed(bvid, 0.0)
+                    except Exception:
+                        pass
+
+            # While incidents are active:
+            # • Every step  → re-apply the infinite travel time on blocked edges
+            #   (SUMO's built-in rerouter resets it otherwise).
+            # • Every 10 steps → reroute vehicles whose next 6 edges include a block.
+            #   currentTravelTimes=False uses adaptTraveltime values, so SUMO's
+            #   Dijkstra won't route through the 1e9-cost blocked edge.
+            #   Built-in --device.rerouting handles the rest automatically.
+            if _incident_edges:
+                for eid in _incident_edges:
+                    try:
+                        traci.edge.adaptTraveltime(eid, 1e9)
+                    except Exception:
+                        pass
+                if step_count % 10 == 0:
+                    for vid in live_ids:
+                        if vid in _broken_vehicles or vid.endswith('_edge'):
+                            continue
+                        try:
+                            route = traci.vehicle.getRoute(vid)
+                            ridx  = traci.vehicle.getRouteIndex(vid)
+                            ahead = route[ridx: ridx + 6]
+                            if any(e in _incident_edges for e in ahead):
+                                traci.vehicle.rerouteTraveltime(vid, currentTravelTimes=False)
+                        except Exception:
+                            pass
 
             traci.simulationStep()
             step_count += 1
@@ -295,6 +503,7 @@ def _traci_thread() -> None:
                 try:
                     x, y     = traci.vehicle.getPosition(vid)
                     lon, lat = traci.simulation.convertGeo(x, y)
+                    is_incident = vid in _broken_vehicles and not vid.endswith('_edge')
                     features.append({
                         "type": "Feature",
                         "id":   vid,
@@ -303,11 +512,13 @@ def _traci_thread() -> None:
                             "coordinates": [lon, lat, 0],
                         },
                         "properties": {
-                            "id":      vid,
-                            "speed":   round(traci.vehicle.getSpeed(vid) * 3.6, 1),
-                            "angle":   traci.vehicle.getAngle(vid),
-                            "type":    traci.vehicle.getTypeID(vid),
-                            "simTime": sim_time,
+                            "id":       vid,
+                            "speed":    round(traci.vehicle.getSpeed(vid) * 3.6, 1),
+                            "angle":    traci.vehicle.getAngle(vid),
+                            "type":     traci.vehicle.getTypeID(vid),
+                            "simTime":  sim_time,
+                            "incident": is_incident,
+                            "incident_type": _broken_vehicles.get(vid, "") if is_incident else "",
                         },
                     })
                 except Exception:
@@ -378,6 +589,40 @@ def _traci_thread() -> None:
                     "vehicle_count": len(features),
                     "sim_time":      sim_time,
                 }))
+
+                # Road-level speed heatmap — coords embedded so frontend never
+                # misses them even if the one-time edge_shapes message was lost.
+                if _edge_shapes:
+                    road_data     = []
+                    forecast_data = []
+                    for eid, pts in _edge_shapes.items():
+                        spd     = traci.edge.getLastStepMeanSpeed(eid)
+                        occ     = traci.edge.getLastStepOccupancy(eid)
+                        veh     = traci.edge.getLastStepVehicleNumber(eid)
+                        blocked = eid in _incident_edges
+                        if spd > 0 or occ > 0 or veh > 0 or blocked:
+                            road_data.append({
+                                "id":      eid,
+                                "spd":     round(spd, 2),
+                                "occ":     round(occ, 1),
+                                "blocked": blocked,
+                                "pts":     pts,   # geometry always included
+                            })
+                        if _incident_edges and (spd > 0 or occ > 0 or blocked):
+                            pred_spd = _predict_speed(eid, spd)
+                            if pred_spd < spd - 1.0 or blocked:
+                                forecast_data.append({
+                                    "id":       eid,
+                                    "cur_spd":  round(spd, 2),
+                                    "pred_spd": round(pred_spd, 2),
+                                    "will_jam": pred_spd < 3.0,
+                                    "blocked":  blocked,
+                                    "pts":      pts,
+                                })
+                    if road_data:
+                        _push(json.dumps({"type": "road_metrics", "edges": road_data}))
+                    if forecast_data:
+                        _push(json.dumps({"type": "impact_forecast", "edges": forecast_data}))
 
             # Ego car live state (speed, lane, road)
             if EGO_ID in vehicle_ids:
@@ -454,6 +699,9 @@ async def ws_handler(websocket) -> None:
                 _cmd_queue.put(cmd)
 
             elif ctype == "tls_control":
+                _cmd_queue.put(cmd)
+
+            elif ctype == "incident":
                 _cmd_queue.put(cmd)
 
     except websockets.exceptions.ConnectionClosedError:

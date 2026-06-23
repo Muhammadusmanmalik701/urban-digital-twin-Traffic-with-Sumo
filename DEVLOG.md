@@ -549,4 +549,141 @@ c1723b3  fix: car follow camera centering for top and follow views
 
 ---
 
-*Last updated: June 2026 | Author: UrbanTwin Dev*
+## 🚦 Session 5 — Traffic Signal Control + Congestion Heatmap (June 2026)
+
+### What was built
+
+#### 1. Traffic Signal Control via TraCI
+- **Frontend:** TLS control panel — click intersection on map → select phase (green/yellow/red) → send to SUMO
+- **Backend (`sumo_live_server.py`):** `_apply_tls_control(cmd)` function
+  - `traci.trafficlight.setPhase(tls_id, phase_index)` — force phase
+  - `traci.trafficlight.setPhaseDuration(tls_id, duration)` — hold duration
+- **3D markers:** Traffic light markers added to map at intersection positions
+- **WebSocket protocol:** `{type: "tls_control", tls_id, phase, duration}`
+
+#### 2. Congestion Heatmap (Dot-based, v1)
+- Edge-level speed/occupancy data from `traci.edge.getLastStepMeanSpeed()` / `getLastStepOccupancy()`
+- Color scale: green (fast) → orange → red (slow/jammed)
+- Point entities rendered at edge midpoints
+- Before/after analytics panel: queue counter showing vehicles slowed per edge
+- Satellite/streets map toggle added
+
+### GitHub Commits
+```
+6dc1ac1  fix: move global declaration to top of _apply_control
+e2a2cac  feat: traffic signal control via TraCI + 3D map markers
+5a5ad24  feat: congestion heatmap + queue counter + before/after analytics
+9fc83b5  fix: heatmap visibility + add streets/satellite map toggle
+cbe59c4  fix: heatmap now uses point entities (reliable 2D/3D) + floor division fix
+```
+
+---
+
+## 🚨 Session 6 — Incident System, Road Heatmap, Alt Routes, Forecasting, VR (June 23 2026)
+
+### What was built
+
+#### 1. Google Maps-Style Road Heatmap (v2 — replaces dot heatmap)
+- **Old:** point entities at edge midpoints (inaccurate, doesn't follow roads)
+- **New:** colored polylines drawn directly ON road segments
+- **Colors:** green ≥40 km/h | amber 25–40 | orange 10–25 | red <10 | dark red = blocked
+- **Width:** varies 5–10px by congestion severity
+- **Key fix — embedded coords:** `pts` coordinates embedded in every `road_metrics` message (instead of relying on one-time `edge_shapes` message that might be missed)
+- **Cesium bug:** `PolylineGlowMaterialProperty` + `clampToGround` = invisible → use plain `Color` instead
+
+#### 2. Vehicle Incident Scenarios
+**Frontend:** click vehicle → incident panel appears with 3 buttons:
+- 🔴 Breakdown — engine failure, vehicle stops
+- 🔥 Fire — vehicle on fire, immediate stop
+- 💥 Accident — collision, vehicle stops
+
+**Backend (`_apply_incident`):**
+```python
+traci.vehicle.setSpeed(veh_id, 0.0)
+traci.vehicle.setMaxSpeed(veh_id, 0.0)
+traci.edge.adaptTraveltime(edge_id, 1e9)  # block edge
+```
+
+**Key bugs fixed:**
+- `live_` prefix mismatch: Cesium entity IDs are `live_f_0.0` but SUMO uses `f_0.0` → strip with `.replace(/^live_/, '')`
+- Incident vehicle kept moving visually: added `incident: true` flag in FeatureCollection → frontend skips `addSample` for incident vehicles (position frozen)
+- `adaptTraveltime(1e9)` reset by SUMO silently → re-apply every simulation step inside `if _incident_edges:` block
+
+#### 3. Auto-Rerouting with Deadlock Prevention
+- SUMO startup flags: `--device.rerouting.period 30 --device.rerouting.adaptation-interval 10`
+- `currentTravelTimes=False` in `rerouteTraveltime()` — uses stored `adaptTraveltime` values (not live speeds) → guaranteed to avoid blocked edge
+- Only reroute vehicles with blocked edge in next 6 edges ahead (prevents mass rerouting deadlock)
+- Every 10 steps: re-check vehicles approaching incident edge
+
+#### 4. Alternate Route Visualization (AI/ML Route Recommendation)
+**Before/after route diff algorithm:**
+```python
+# Snapshot routes BEFORE rerouting
+affected_before = {vid: set(route) for vid in live_ids if edge_id in route}
+# Reroute
+traci.vehicle.rerouteTraveltime(vid, currentTravelTimes=False)
+# Diff → find detour edges
+detour_freq = Counter(eid for vid, old in affected_before.items()
+                      for eid in new_route if eid not in old)
+```
+**Frontend:** cyan polylines on detour roads (width/alpha proportional to usage frequency), dark red on blocked edge. Toggle button to show/hide.
+
+#### 5. Predictive Congestion Forecasting
+- Rolling 8-reading speed history per edge
+- Linear slope extrapolation 3 steps ahead: `predicted = last + slope × 3`
+- Orange dashed lines = will-jam edges, yellow dashed = slowing edges
+- `PolylineDashMaterialProperty` for dashed rendering
+- Toggle button to show/hide forecast layer
+
+#### 6. Digital Twin Impact Analysis Panel
+Floating panel (bottom-left) showing after incident:
+- Affected vehicles count
+- Rerouted vehicles count
+- Alternate corridors found
+- Blocked edge ID
+- Layer toggles for Alt Routes / Forecast
+
+#### 7. Mapbox Isochrone API
+- ORS API login failed (HeiGIT session transfer error) → switched to Mapbox
+- `GET /isochrone/v1/mapbox/{profile}/{lon},{lat}?contours_minutes=10,20,30&polygons=true`
+- Key stored in `frontend/.env` as `VITE_MAPBOX_ISO_KEY`
+- Click map → shows 10/20/30 min travel radius polygons
+- Bug fix: `isoClickHandler` scope error → fixed with `isoClickHandlerRef = useRef<any>(null)`
+
+#### 8. WebXR VR Support (HTC Vive Cosmos Elite)
+- WebXR support detection: polls `navigator.xr.isSessionSupported('immersive-vr')` every 5s
+- Handles SteamVR starting after browser loads
+- `navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] })`
+- `viewer.scene.useWebVR = true` + `xrSession` assignment
+- VR button: 3 states — "detecting…" / "VR Mode" (violet border) / "Exit VR" (violet glow)
+- VR HUD overlay: vehicle count, sim time, incident badge, traffic legend, Exit button
+- `(navigator as any).xr` cast fixes TypeScript error
+
+**Hardware note:** Cosmos Elite requires DisplayPort + USB + DC power (wired) OR VIVE Wireless Adapter (~$300) for wireless. Laptop HDMI → need Active DisplayPort to HDMI adapter (~$15-20).
+
+### Key Refs Added (`CesiumViewer.tsx`)
+```typescript
+const edgeShapes          = useRef<Map<string, number[][]>>(new Map())
+const roadMetricEntities  = useRef<Map<string, any>>(new Map())
+const incidentEntities    = useRef<Map<string, any>>(new Map())
+const altRouteEntities    = useRef<any[]>([])
+const forecastEntities    = useRef<Map<string, any>>(new Map())
+const isoClickHandlerRef  = useRef<any>(null)
+```
+
+### Shared State (`sumo_live_server.py`)
+```python
+_broken_vehicles: dict = {}   # { veh_id: incident_type, veh_id+"_edge": edge_id }
+_incident_edges:  set  = set()  # edge IDs blocked by incidents
+_edge_shapes:     dict = {}   # { edge_id: [[lon, lat], ...] }
+_speed_history:   dict = {}   # { edge_id: [spd1, spd2, ...] } rolling window
+```
+
+### GitHub Commits
+```
+[Session 6 commits — pushed June 23 2026]
+```
+
+---
+
+*Last updated: June 23 2026 | Author: UrbanTwin Dev*

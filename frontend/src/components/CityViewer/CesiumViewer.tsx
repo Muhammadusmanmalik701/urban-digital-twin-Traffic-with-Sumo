@@ -23,6 +23,7 @@ const {
   SampledPositionProperty,
   LinearApproximation,
   ExtrapolationType,
+  PolygonHierarchy,
   JulianDate,
   ClockRange,
   SceneMode,
@@ -306,6 +307,18 @@ export function CesiumViewer() {
   const showHeatmapRef      = useRef(true)
   const satelliteLayerRef   = useRef<any>(null)
   const streetsLayerRef     = useRef<any>(null)
+  const isoEntities         = useRef<any[]>([])
+  const isoCenterEntity     = useRef<any>(null)
+  const isoModeRef          = useRef(false)
+  const isoTravelRef        = useRef('driving-car')
+  const isoPointRef         = useRef<{ lon: number; lat: number } | null>(null)
+  const fetchIsochroneRef   = useRef<(lon: number, lat: number) => void>(() => {})
+  const isoClickHandlerRef  = useRef<any>(null)
+  const edgeShapes          = useRef<Map<string, number[][]>>(new Map())
+  const roadMetricEntities  = useRef<Map<string, any>>(new Map())
+  const incidentEntities    = useRef<Map<string, any>>(new Map())
+  const altRouteEntities    = useRef<any[]>([])
+  const forecastEntities    = useRef<Map<string, any>>(new Map())
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -322,10 +335,25 @@ export function CesiumViewer() {
   const [tlsSelected, setTlsSelected]           = useState<string | null>(null)
   const [tlsOverrideCount, setTlsOverrideCount] = useState(0)
   const setTlsSelectedRef = useRef<(id: string | null) => void>(() => {})
-  const [mapStyle, setMapStyle]         = useState<'satellite' | 'streets'>('satellite')
-  const [showHeatmap, setShowHeatmap]   = useState(true)
+  const [isoMode, setIsoMode]       = useState(false)
+  const [isoLoading, setIsoLoading] = useState(false)
+  const [isoPoint, setIsoPoint]     = useState<{ lon: number; lat: number } | null>(null)
+  const [isoTravel, setIsoTravel]   = useState<'driving-car' | 'foot-walking' | 'cycling-regular'>('driving-car')
+  const [mapStyle, setMapStyle]     = useState<'satellite' | 'streets'>('satellite')
+  const [showHeatmap, setShowHeatmap]   = useState(false)
   const [trafficStats, setTrafficStats] = useState<{ avg_speed: number; stopped_count: number; vehicle_count: number } | null>(null)
   const [baseline, setBaseline]         = useState<{ avg_speed: number; stopped_count: number } | null>(null)
+  const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(null)
+  const [activeIncidents, setActiveIncidents]     = useState<Map<string, { type: string; lon: number; lat: number }>>(new Map())
+  const [showRoadHeat, setShowRoadHeat]           = useState(true)
+  const showRoadHeatRef = useRef(true)
+  const [altRoutesInfo, setAltRoutesInfo] = useState<{ affected: number; rerouted: number; altCount: number; incidentEdge: string } | null>(null)
+  const [showAltRoutes, setShowAltRoutes] = useState(true)
+  const [showForecast, setShowForecast]   = useState(true)
+  const showAltRoutesRef = useRef(true)
+  const showForecastRef  = useRef(true)
+  const [vrMode, setVrMode]           = useState(false)
+  const [vrSupported, setVrSupported] = useState(false)
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
@@ -455,6 +483,138 @@ export function CesiumViewer() {
   startFollowRef.current    = startFollow
   setTlsSelectedRef.current = setTlsSelected
   showHeatmapRef.current    = showHeatmap
+  showRoadHeatRef.current   = showRoadHeat
+  showAltRoutesRef.current  = showAltRoutes
+  showForecastRef.current   = showForecast
+  isoModeRef.current        = isoMode
+  isoTravelRef.current      = isoTravel
+  isoPointRef.current       = isoPoint
+
+  // ── Isochrone maps ────────────────────────────────────────────────────────
+  const clearIsochrone = useCallback(() => {
+    const v = cesiumViewer.current
+    if (v) {
+      isoEntities.current.forEach(e => v.entities.remove(e))
+      if (isoCenterEntity.current) v.entities.remove(isoCenterEntity.current)
+    }
+    isoEntities.current = []
+    isoCenterEntity.current = null
+    setIsoPoint(null)
+    setIsoMode(false)
+    if (viewerRef.current) viewerRef.current.style.cursor = ''
+  }, [])
+
+  const fetchIsochrone = useCallback(async (lon: number, lat: number) => {
+    const v = cesiumViewer.current
+    if (!v) return
+
+    // Clear previous results
+    isoEntities.current.forEach(e => v.entities.remove(e))
+    if (isoCenterEntity.current) v.entities.remove(isoCenterEntity.current)
+    isoEntities.current = []
+
+    setIsoLoading(true)
+    setIsoPoint({ lon, lat })
+    setIsoMode(false)
+    if (viewerRef.current) viewerRef.current.style.cursor = ''
+
+    // Center pin
+    isoCenterEntity.current = v.entities.add({
+      position: Cartesian3.fromDegrees(lon, lat, 5),
+      point: {
+        pixelSize: 14, color: Color.WHITE,
+        outlineColor: Color.fromCssColorString('#3b82f6'), outlineWidth: 3,
+        heightReference: HeightReference.CLAMP_TO_GROUND,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      label: {
+        text: '📍', font: '18px Arial',
+        verticalOrigin: VerticalOrigin.BOTTOM,
+        pixelOffset: new Cartesian2(0, -16),
+        heightReference: HeightReference.CLAMP_TO_GROUND,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    })
+
+    const key = import.meta.env.VITE_MAPBOX_ISO_KEY
+    if (!key) {
+      console.warn('[Isochrone] Add VITE_MAPBOX_ISO_KEY to frontend/.env')
+      setIsoLoading(false)
+      return
+    }
+
+    try {
+      // Map ORS profile names → Mapbox profile names
+      const profileMap: Record<string, string> = {
+        'driving-car':     'driving',
+        'foot-walking':    'walking',
+        'cycling-regular': 'cycling',
+      }
+      const profile = profileMap[isoTravelRef.current] ?? 'driving'
+
+      const url = `https://api.mapbox.com/isochrone/v1/mapbox/${profile}/${lon},${lat}` +
+        `?contours_minutes=10,20,30&polygons=true&access_token=${key}`
+
+      const res = await fetch(url)
+      if (!res.ok) throw new Error(`Mapbox ${res.status}`)
+      const data = await res.json()
+
+      // Mapbox returns features ordered 10→20→30 min; render largest first (30 min)
+      const ISO_STYLE: Record<number, { hex: string; fillAlpha: number }> = {
+        30: { hex: '#ef4444', fillAlpha: 0.18 },
+        20: { hex: '#f97316', fillAlpha: 0.28 },
+        10: { hex: '#22c55e', fillAlpha: 0.40 },
+      }
+
+      const features = [...(data.features ?? [])].sort(
+        (a: any, b: any) => (b.properties?.contour ?? 0) - (a.properties?.contour ?? 0)
+      )
+      features.forEach((feat: any) => {
+        const val  = feat.properties?.contour ?? 0
+        const cfg  = ISO_STYLE[val] ?? { hex: '#94a3b8', fillAlpha: 0.20 }
+        const fill = Color.fromCssColorString(cfg.hex).withAlpha(cfg.fillAlpha)
+        const edge = Color.fromCssColorString(cfg.hex).withAlpha(0.85)
+        const geom = feat.geometry
+        const ringsArr: number[][][] =
+          geom.type === 'MultiPolygon'
+            ? geom.coordinates.flatMap((p: number[][][]) => p)
+            : geom.coordinates
+        ringsArr.forEach((ring: number[][]) => {
+          const positions = ring.map(([ln, lt]: number[]) =>
+            Cartesian3.fromDegrees(ln, lt, 0)
+          )
+          const e = v.entities.add({
+            polygon: {
+              hierarchy: new PolygonHierarchy(positions),
+              material: fill,
+              outline: true,
+              outlineColor: edge,
+              outlineWidth: 2,
+              height: 0,
+            },
+          })
+          isoEntities.current.push(e)
+        })
+      })
+    } catch (err) {
+      console.error('[Isochrone] Failed:', err)
+    } finally {
+      setIsoLoading(false)
+    }
+  }, [])
+
+  // Keep fetchIsochroneRef in sync so Cesium click handler always calls latest
+  fetchIsochroneRef.current = fetchIsochrone
+
+  // ── Incident control ──────────────────────────────────────────────────────
+  const sendIncident = useCallback((vehId: string, incidentType: string) => {
+    if (liveWS.current?.readyState === WebSocket.OPEN) {
+      liveWS.current.send(JSON.stringify({ type: 'incident', veh_id: vehId, incident_type: incidentType }))
+    }
+    if (incidentType === 'clear') {
+      setSelectedVehicleId(null)
+    }
+  }, [])
 
   // ── Traffic signal control ─────────────────────────────────────────────────
   const sendTlsControl = useCallback((tlsId: string, action: string) => {
@@ -594,9 +754,26 @@ export function CesiumViewer() {
 
       if (cancelled) return
 
+      // Isochrone: left-click picks globe position when iso mode active
+      const isoClickHandler = new ScreenSpaceEventHandler(lv.canvas)
+      isoClickHandlerRef.current = isoClickHandler
+      isoClickHandler.setInputAction((click: any) => {
+        if (!isoModeRef.current) return
+        const ray = lv.camera.getPickRay(click.position)
+        if (!ray) return
+        const earthPos = lv.scene.globe.pick(ray, lv.scene)
+        if (!earthPos) return
+        const carto = Cartographic.fromCartesian(earthPos)
+        fetchIsochroneRef.current(
+          CesiumMath.toDegrees(carto.longitude),
+          CesiumMath.toDegrees(carto.latitude)
+        )
+      }, ScreenSpaceEventType.LEFT_CLICK)
+
       // Entity click
       lv.selectedEntityChanged.addEventListener((sel: any) => {
         if (!sel) return
+        if (isoModeRef.current) { lv!.selectedEntity = undefined; return }
         const mtype = sel.properties?.markerType?.getValue?.()
         if (mtype === 'area') {
           const key = sel.properties.areaKey.getValue()
@@ -616,6 +793,9 @@ export function CesiumViewer() {
         // Car click (live SUMO vehicles have a model)
         if (sel.model) {
           startFollowRef.current?.(sel, 'top')
+          // Entity IDs are "live_<sumo_id>" — strip prefix to get the SUMO vehicle ID
+          const sumoId = (sel.id as string).replace(/^live_/, '')
+          setSelectedVehicleId(sumoId)
           lv!.selectedEntity = undefined
           return
         }
@@ -760,6 +940,8 @@ export function CesiumViewer() {
       clockTickOff.current?.()
       hoverHandlerRef.current?.destroy()
       hoverHandlerRef.current = null
+      isoClickHandlerRef.current?.destroy()
+      isoClickHandlerRef.current = null
       if (preRenderListenerRef.current && lv) {
         lv.scene.postRender.removeEventListener(preRenderListenerRef.current)
         preRenderListenerRef.current = null
@@ -1238,6 +1420,168 @@ export function CesiumViewer() {
         return
       }
 
+      // Edge shapes — store geometry once for road heatmap rendering
+      if (data.type === 'edge_shapes') {
+        edgeShapes.current.clear()
+        Object.entries(data.edges as Record<string, number[][]>).forEach(([id, pts]) => {
+          edgeShapes.current.set(id, pts)
+        })
+        return
+      }
+
+      // Road-level speed heatmap — Google Maps traffic style (plain Color, clampToGround safe)
+      if (data.type === 'road_metrics') {
+        const v = cesiumViewer.current
+        if (!v || !showRoadHeatRef.current) return
+
+        const trafficColor = (spd: number, blocked: boolean): [any, number] => {
+          if (blocked) return [Color.fromCssColorString('#991b1b').withAlpha(1.0), 10]
+          const kmh = spd * 3.6
+          if (kmh >= 40) return [Color.fromCssColorString('#15803d').withAlpha(0.92), 5]
+          if (kmh >= 25) return [Color.fromCssColorString('#b45309').withAlpha(0.94), 6]
+          if (kmh >= 10) return [Color.fromCssColorString('#c2410c').withAlpha(0.96), 7]
+          return               [Color.fromCssColorString('#b91c1c').withAlpha(1.00), 8]
+        }
+
+        ;(data.edges ?? []).forEach((edge: any) => {
+          // Use coords embedded in message (reliable) with edgeShapes as fallback
+          const pts: number[][] = edge.pts?.length >= 2
+            ? edge.pts
+            : edgeShapes.current.get(edge.id) ?? []
+          if (pts.length < 2) return
+          const positions = pts.map(([ln, lt]: number[]) => Cartesian3.fromDegrees(ln, lt, 1))
+          const [color, width] = trafficColor(edge.spd, edge.blocked)
+
+          const existing = roadMetricEntities.current.get(edge.id)
+          if (existing) {
+            existing.polyline.positions = new ConstantProperty(positions)
+            existing.polyline.material  = new ConstantProperty(color)
+            existing.polyline.width     = new ConstantProperty(width)
+          } else {
+            const e = v.entities.add({
+              polyline: { positions, width, material: color, clampToGround: true },
+            })
+            roadMetricEntities.current.set(edge.id, e)
+          }
+        })
+        return
+      }
+
+      // Incident triggered — add marker on map
+      if (data.type === 'incident') {
+        const v = cesiumViewer.current
+        if (!v) return
+        const icons: Record<string, string> = { breakdown: '🔧', fire: '🔥', accident: '💥' }
+        const colors: Record<string, string> = { breakdown: '#f97316', fire: '#dc2626', accident: '#7c3aed' }
+        const icon  = icons[data.incident_type]  ?? '⚠️'
+        const hexC  = colors[data.incident_type] ?? '#f97316'
+        const old   = incidentEntities.current.get(data.veh_id)
+        if (old) v.entities.remove(old)
+        const e = v.entities.add({
+          position: Cartesian3.fromDegrees(data.lon, data.lat, 5),
+          point: {
+            pixelSize: 18, color: Color.fromCssColorString(hexC),
+            outlineColor: Color.WHITE, outlineWidth: 2,
+            heightReference: HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+          label: {
+            text: icon, font: '22px Arial',
+            verticalOrigin: VerticalOrigin.BOTTOM,
+            pixelOffset: new Cartesian2(0, -22),
+            heightReference: HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+        })
+        incidentEntities.current.set(data.veh_id, e)
+        setActiveIncidents(prev => new Map(prev).set(data.veh_id, { type: data.incident_type, lon: data.lon, lat: data.lat }))
+        return
+      }
+
+      // Incident cleared — remove marker + clear alt routes/forecast
+      if (data.type === 'incident_cleared') {
+        const v = cesiumViewer.current
+        const old = incidentEntities.current.get(data.veh_id)
+        if (old && v) v.entities.remove(old)
+        incidentEntities.current.delete(data.veh_id)
+        setActiveIncidents(prev => { const m = new Map(prev); m.delete(data.veh_id); return m })
+        // Clear alt routes + forecast when all incidents gone
+        if (incidentEntities.current.size === 0) {
+          altRouteEntities.current.forEach(e => v?.entities.remove(e))
+          altRouteEntities.current = []
+          forecastEntities.current.forEach(e => v?.entities.remove(e))
+          forecastEntities.current.clear()
+          setAltRoutesInfo(null)
+        }
+        return
+      }
+
+      // Alternate routes — AI-computed detour corridors after incident
+      if (data.type === 'alt_routes') {
+        const v = cesiumViewer.current
+        if (!v) return
+        // Clear previous alt route lines
+        altRouteEntities.current.forEach(e => v.entities.remove(e))
+        altRouteEntities.current = []
+        if (!showAltRoutesRef.current) {
+          setAltRoutesInfo({ affected: data.affected, rerouted: data.rerouted, altCount: (data.alt_edges ?? []).length, incidentEdge: data.incident_edge })
+          return
+        }
+        // Draw incident edge in bright red (blocked road)
+        if (data.incident_coords?.length >= 2) {
+          const pos = data.incident_coords.map(([ln, lt]: number[]) => Cartesian3.fromDegrees(ln, lt, 2))
+          altRouteEntities.current.push(v.entities.add({
+            polyline: { positions: pos, width: 8, material: Color.fromCssColorString('#dc2626').withAlpha(0.95), clampToGround: true },
+          }))
+        }
+        // Draw alternate route corridors: brightness = usage frequency
+        const maxUsage = Math.max(1, ...(data.alt_edges ?? []).map((e: any) => e.usage))
+        ;(data.alt_edges ?? []).forEach((edge: any) => {
+          if (!edge.coords || edge.coords.length < 2) return
+          const alpha = 0.55 + 0.40 * (edge.usage / maxUsage)
+          const width = 3 + Math.round(4 * (edge.usage / maxUsage))
+          const pos   = edge.coords.map(([ln, lt]: number[]) => Cartesian3.fromDegrees(ln, lt, 3))
+          altRouteEntities.current.push(v.entities.add({
+            polyline: {
+              positions: pos, width, clampToGround: true,
+              material: Color.fromCssColorString('#06b6d4').withAlpha(alpha),
+            },
+          }))
+        })
+        setAltRoutesInfo({ affected: data.affected, rerouted: data.rerouted, altCount: (data.alt_edges ?? []).length, incidentEdge: data.incident_edge })
+        return
+      }
+
+      // Predictive congestion forecast — dashed warning overlay on edges expected to congest
+      if (data.type === 'impact_forecast') {
+        const v = cesiumViewer.current
+        if (!v || !showForecastRef.current) return
+        ;(data.edges ?? []).forEach((edge: any) => {
+          const coords = edgeShapes.current.get(edge.id)
+          if (!coords || coords.length < 2) return
+          const pos = coords.map(([ln, lt]: number[]) => Cartesian3.fromDegrees(ln, lt, 4))
+          const color = edge.will_jam
+            ? Color.fromCssColorString('#f97316').withAlpha(0.90)
+            : Color.fromCssColorString('#fbbf24').withAlpha(0.70)
+          const existing = forecastEntities.current.get(edge.id)
+          if (existing) {
+            existing.polyline.positions = new ConstantProperty(pos)
+            existing.polyline.material  = new ConstantProperty(
+              new PolylineDashMaterialProperty({ color, dashLength: 12 })
+            )
+          } else {
+            const e = v.entities.add({
+              polyline: {
+                positions: pos, width: 4, clampToGround: true,
+                material: new PolylineDashMaterialProperty({ color, dashLength: 12 }),
+              },
+            })
+            forecastEntities.current.set(edge.id, e)
+          }
+        })
+        return
+      }
+
       // Vehicle position update: GeoJSON FeatureCollection
       if (data.type === 'FeatureCollection') {
         setLiveState('running')
@@ -1259,10 +1603,11 @@ export function CesiumViewer() {
 
         const activeIds = new Set<string>()
         ;(data.features ?? []).forEach((f: any) => {
-          const id: string  = String(f.id ?? f.properties?.id)
-          const [lon, lat]  = f.geometry.coordinates
-          const angle       = f.properties?.angle  ?? 0
-          const vtype       = f.properties?.type   ?? 'passenger'
+          const id: string     = String(f.id ?? f.properties?.id)
+          const [lon, lat]     = f.geometry.coordinates
+          const angle          = f.properties?.angle  ?? 0
+          const vtype          = f.properties?.type   ?? 'passenger'
+          const isIncident     = f.properties?.incident === true
           activeIds.add(id)
 
           const pos    = Cartesian3.fromDegrees(lon, lat, 0)
@@ -1270,9 +1615,15 @@ export function CesiumViewer() {
 
           if (liveEntities.current.has(id)) {
             const ent = liveEntities.current.get(id)
-            ;(ent.position as any).addSample(jt, pos)
-            ent.orientation = new ConstantProperty(orient)
-            vehicleAngleMap.set(ent, angle)
+            // Incident vehicles: freeze position, dim color — don't update samples
+            if (isIncident) {
+              ;(ent.model as any).color        = new ConstantProperty(Color.fromCssColorString('#6b7280').withAlpha(0.6))
+              ;(ent.model as any).colorBlendAmount = new ConstantProperty(0.8)
+            } else {
+              ;(ent.position as any).addSample(jt, pos)
+              ent.orientation = new ConstantProperty(orient)
+              vehicleAngleMap.set(ent, angle)
+            }
           } else {
             const sampledPos = new SampledPositionProperty()
             sampledPos.setInterpolationOptions({ interpolationAlgorithm: LinearApproximation, interpolationDegree: 1 })
@@ -1280,7 +1631,12 @@ export function CesiumViewer() {
             sampledPos.backwardExtrapolationType = ExtrapolationType.HOLD
             sampledPos.addSample(jt, pos)
             const isEgo = id === 'f_0.0'
-            const vm = getVehicleModel(vtype, id)
+            const vm    = getVehicleModel(vtype, id)
+            const modelColor = isIncident
+              ? Color.fromCssColorString('#6b7280').withAlpha(0.6)
+              : isEgo
+                ? Color.fromCssColorString('#fbbf24')
+                : (vm.color ?? Color.WHITE)
             const e = v.entities.add({
               id: `live_${id}`,
               position: sampledPos,
@@ -1291,17 +1647,15 @@ export function CesiumViewer() {
                 minimumPixelSize: isEgo ? 16 : 10,
                 maximumScale: vm.maxScale,
                 heightReference: HeightReference.CLAMP_TO_GROUND,
-                color: isEgo
-                  ? Color.fromCssColorString('#fbbf24')
-                  : (vm.color ?? Color.WHITE),
+                color: modelColor,
                 colorBlendMode: ColorBlendMode.HIGHLIGHT,
-                colorBlendAmount: vm.blendAmount ?? 0.35,
+                colorBlendAmount: isIncident ? 0.8 : (vm.blendAmount ?? 0.35),
               },
             })
             vehicleAngleMap.set(e, angle)
             liveEntities.current.set(id, e)
-            // Auto-follow ego car when it first appears
-            if (isEgo && !egoFollowedRef.current) {
+            // Auto-follow ego car when it first appears (skip incident vehicles)
+            if (isEgo && !egoFollowedRef.current && !isIncident) {
               egoFollowedRef.current = true
               setEgoActive(true)
               startFollowRef.current?.(e, 'top')
@@ -1357,7 +1711,93 @@ export function CesiumViewer() {
     setLiveCount(0)
     setLiveSimTime(0)
     setLiveMsg('')
+    // Clear road metrics
+    roadMetricEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+    roadMetricEntities.current.clear()
+    // Clear incidents
+    incidentEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+    incidentEntities.current.clear()
+    // Clear alt routes + forecast
+    altRouteEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+    altRouteEntities.current = []
+    forecastEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+    forecastEntities.current.clear()
+    edgeShapes.current.clear()
+    setActiveIncidents(new Map())
+    setSelectedVehicleId(null)
+    setAltRoutesInfo(null)
+    // Clear isochrone
+    isoEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+    if (isoCenterEntity.current) cesiumViewer.current?.entities.remove(isoCenterEntity.current)
+    isoEntities.current = []
+    isoCenterEntity.current = null
+    setIsoPoint(null)
+    setIsoMode(false)
+    if (viewerRef.current) viewerRef.current.style.cursor = ''
   }, [])
+
+  // ── Isochrone: cursor crosshair when in pick mode ──────────────────────────
+  useEffect(() => {
+    if (!viewerRef.current) return
+    viewerRef.current.style.cursor = isoMode ? 'crosshair' : ''
+  }, [isoMode])
+
+  // ── Isochrone: re-fetch when travel mode changes (if point already picked) ──
+  useEffect(() => {
+    if (isoPoint) fetchIsochrone(isoPoint.lon, isoPoint.lat)
+  }, [isoTravel]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── WebXR / VR support detection (re-checks every 5s — SteamVR may start late) ─
+  useEffect(() => {
+    const check = () => {
+      const xr = (navigator as any).xr
+      if (xr) {
+        xr.isSessionSupported('immersive-vr')
+          .then((ok: boolean) => setVrSupported(ok))
+          .catch(() => setVrSupported(false))
+      }
+    }
+    check()
+    const id = setInterval(check, 5000)
+    return () => clearInterval(id)
+  }, [])
+
+  // ── VR mode toggle: properly request WebXR immersive session (SteamVR / Quest) ─
+  useEffect(() => {
+    const v = cesiumViewer.current
+    if (!v) return
+
+    if (vrMode) {
+      const xr = (navigator as any).xr
+      if (xr) {
+        // Request immersive-vr session — Chrome shows headset permission dialog
+        xr.requestSession('immersive-vr', {
+          optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'],
+        })
+          .then((session: any) => {
+            // Hand session to Cesium's internal WebXR path
+            try {
+              v.scene.useWebVR = true
+              // If Cesium exposes xrSession, set it directly
+              if ('xrSession' in v.scene) {
+                (v.scene as any).xrSession = session
+              }
+            } catch (e) {
+              console.warn('[VR] Cesium WebXR session error:', e)
+            }
+          })
+          .catch((e: any) => {
+            console.warn('[VR] Session request denied or failed:', e)
+            setVrMode(false)
+          })
+      } else {
+        // Fallback for browsers without full WebXR (older Chrome builds)
+        try { v.scene.useWebVR = true } catch {}
+      }
+    } else {
+      try { v.scene.useWebVR = false } catch {}
+    }
+  }, [vrMode])
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -1505,7 +1945,7 @@ export function CesiumViewer() {
         </div>
       )}
 
-      {/* ── Live 2D/3D + map style toggles (bottom-right when live) ── */}
+      {/* ── Live 2D/3D + map style + isochrone + VR toggles (bottom-right) ── */}
       {liveState === 'running' && (
         <div className="absolute bottom-8 right-3 z-10 flex flex-col gap-1.5">
           <button
@@ -1524,6 +1964,155 @@ export function CesiumViewer() {
           >
             {sim.is3D ? '🗺️ 2D' : '🌐 3D'}
           </button>
+          <button
+            onClick={() => {
+              if (isoMode) { setIsoMode(false) }
+              else if (isoPoint) { clearIsochrone() }
+              else { setIsoMode(true) }
+            }}
+            className={`text-xs px-3 py-1.5 rounded-lg backdrop-blur border font-semibold transition-all ${
+              isoMode
+                ? 'bg-purple-500/30 border-purple-400/70 text-purple-300 animate-pulse'
+                : isoPoint
+                  ? 'bg-purple-500/20 border-purple-400/50 text-purple-300'
+                  : 'bg-gray-900/90 border-white/15 text-gray-300 hover:text-white hover:bg-white/10'
+            }`}
+          >
+            {isoMode ? '✕ Cancel Pick' : '📍 Isochrone'}
+          </button>
+
+          {/* VR button — glows when active, dimmed if SteamVR not detected yet */}
+          <button
+            onClick={() => setVrMode(v => !v)}
+            title={
+              vrMode        ? 'Exit VR mode'
+              : vrSupported ? 'Enter VR — put on headset after clicking'
+              :               'SteamVR not detected — start SteamVR then try'
+            }
+            className={`text-xs px-3 py-1.5 rounded-lg backdrop-blur border font-semibold transition-all ${
+              vrMode
+                ? 'bg-violet-500/35 border-violet-400/80 text-violet-200 shadow-[0_0_14px_rgba(139,92,246,0.6)]'
+                : vrSupported
+                  ? 'bg-gray-900/90 border-violet-500/50 text-violet-300 hover:bg-violet-900/30 hover:border-violet-400'
+                  : 'bg-gray-900/70 border-white/10 text-gray-500 hover:text-violet-400 hover:border-violet-600/40'
+            }`}
+          >
+            {vrMode ? '🥽 Exit VR' : vrSupported ? '🥽 VR Mode' : '🥽 VR (detecting…)'}
+          </button>
+        </div>
+      )}
+
+      {/* ── VR Mode overlay — minimal HUD shown inside VR stereo view ── */}
+      {vrMode && (
+        <div className="absolute inset-0 z-30 pointer-events-none flex flex-col items-center justify-between py-8 px-12">
+          {/* Top bar */}
+          <div className="flex items-center gap-4 bg-black/50 backdrop-blur rounded-2xl px-6 py-3 border border-violet-400/30">
+            <span className="text-violet-300 font-bold text-sm tracking-widest">🥽 VR — BORDEAUX DIGITAL TWIN</span>
+            <span className="w-px h-4 bg-white/20" />
+            <span className="text-gray-300 text-xs font-mono">
+              {liveCount} vehicles · {Math.floor(liveSimTime / 60).toString().padStart(2,'0')}:{(liveSimTime % 60).toString().padStart(2,'0')} sim
+            </span>
+            {activeIncidents.size > 0 && (
+              <>
+                <span className="w-px h-4 bg-white/20" />
+                <span className="text-red-300 text-xs font-bold animate-pulse">
+                  ⚠️ {activeIncidents.size} incident{activeIncidents.size > 1 ? 's' : ''}
+                </span>
+              </>
+            )}
+          </div>
+
+          {/* Bottom legend */}
+          <div className="flex items-center gap-6 bg-black/50 backdrop-blur rounded-2xl px-6 py-3 border border-white/15">
+            {[
+              { color: '#15803d', label: 'Free flow  40+ km/h' },
+              { color: '#b45309', label: 'Slow  25-40' },
+              { color: '#c2410c', label: 'Congested  10-25' },
+              { color: '#b91c1c', label: 'Jam  <10 km/h' },
+            ].map(({ color, label }) => (
+              <div key={label} className="flex items-center gap-1.5">
+                <span className="w-4 h-2 rounded-sm" style={{ background: color }} />
+                <span className="text-gray-300 text-[10px]">{label}</span>
+              </div>
+            ))}
+            <span className="w-px h-4 bg-white/20" />
+            <button
+              onClick={() => setVrMode(false)}
+              className="pointer-events-auto text-xs text-red-300 border border-red-500/40 rounded-lg px-3 py-1 bg-red-950/50 hover:bg-red-900/40 transition-all font-semibold"
+            >
+              ✕ Exit VR
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Isochrone pick hint ── */}
+      {isoMode && (
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-purple-950/90 backdrop-blur-xl border border-purple-400/60 rounded-xl px-4 py-2 shadow-2xl pointer-events-none">
+          <span className="w-2 h-2 rounded-full bg-purple-400 animate-ping" />
+          <span className="text-purple-200 text-xs font-semibold">Click anywhere on the map to place isochrone</span>
+        </div>
+      )}
+
+      {/* ── Isochrone results panel (bottom-right, below buttons) ── */}
+      {isoPoint && !isoMode && (
+        <div className="absolute bottom-8 right-16 z-20 bg-gray-950/95 backdrop-blur-xl border border-purple-400/30 rounded-2xl px-4 py-3 shadow-2xl min-w-[220px]">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold text-purple-300 tracking-wide">📍 Travel Time Zones</span>
+            <button
+              onClick={clearIsochrone}
+              className="text-gray-500 hover:text-white text-xs transition-colors"
+            >✕</button>
+          </div>
+
+          {/* Travel mode tabs */}
+          <div className="flex gap-1 mb-3">
+            {([
+              { id: 'driving-car',      label: '🚗', title: 'Drive' },
+              { id: 'foot-walking',     label: '🚶', title: 'Walk'  },
+              { id: 'cycling-regular',  label: '🚲', title: 'Bike'  },
+            ] as { id: 'driving-car' | 'foot-walking' | 'cycling-regular'; label: string; title: string }[]).map(m => (
+              <button
+                key={m.id}
+                onClick={() => setIsoTravel(m.id)}
+                title={m.title}
+                className={`flex-1 py-1 text-sm rounded-lg border transition-all font-semibold ${
+                  isoTravel === m.id
+                    ? 'bg-purple-500/30 border-purple-400/60 text-purple-200'
+                    : 'bg-gray-800/60 border-white/10 text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Legend */}
+          {isoLoading ? (
+            <div className="flex items-center gap-2 py-1">
+              <span className="w-2 h-2 rounded-full bg-purple-400 animate-ping" />
+              <span className="text-gray-400 text-xs">Calculating zones…</span>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              {[
+                { color: '#22c55e', label: '10 min' },
+                { color: '#f97316', label: '20 min' },
+                { color: '#ef4444', label: '30 min' },
+              ].map(({ color, label }) => (
+                <div key={label} className="flex items-center gap-2">
+                  <span className="w-3 h-3 rounded-sm flex-shrink-0" style={{ background: color, opacity: 0.85 }} />
+                  <span className="text-gray-300 text-xs">{label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!import.meta.env.VITE_MAPBOX_ISO_KEY && (
+            <p className="text-amber-400 text-[10px] mt-2 leading-tight">
+              ⚠️ Add VITE_MAPBOX_ISO_KEY to frontend/.env
+            </p>
+          )}
         </div>
       )}
 
@@ -1629,8 +2218,50 @@ export function CesiumViewer() {
                 : 'bg-white/5 border-white/15 text-gray-400 hover:bg-white/10 hover:text-white'
             }`}
           >
-            🌡 Congestion Heatmap {showHeatmap ? 'ON' : 'OFF'}
+            🌡 Dot Heatmap {showHeatmap ? 'ON' : 'OFF'}
           </button>
+          {/* Road heatmap toggle */}
+          <button
+            onClick={() => {
+              const next = !showRoadHeat
+              setShowRoadHeat(next)
+              if (!next) {
+                roadMetricEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+                roadMetricEntities.current.clear()
+              }
+            }}
+            className={`mt-1 w-full text-xs py-1.5 rounded-lg font-semibold border transition-all flex items-center justify-center gap-1.5 ${
+              showRoadHeat
+                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/25'
+                : 'bg-white/5 border-white/15 text-gray-400 hover:bg-white/10 hover:text-white'
+            }`}
+          >
+            🛣 Road Speed Map {showRoadHeat ? 'ON' : 'OFF'}
+          </button>
+          {altRoutesInfo && (
+            <>
+              <button
+                onClick={() => {
+                  const next = !showAltRoutes
+                  setShowAltRoutes(next)
+                  if (!next) { altRouteEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e)); altRouteEntities.current = [] }
+                }}
+                className={`mt-1 w-full text-xs py-1.5 rounded-lg font-semibold border transition-all flex items-center justify-center gap-1.5 ${showAltRoutes ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-400 hover:bg-cyan-500/25' : 'bg-white/5 border-white/15 text-gray-400 hover:bg-white/10 hover:text-white'}`}
+              >
+                🔀 Alternate Routes {showAltRoutes ? 'ON' : 'OFF'}
+              </button>
+              <button
+                onClick={() => {
+                  const next = !showForecast
+                  setShowForecast(next)
+                  if (!next) { forecastEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e)); forecastEntities.current.clear() }
+                }}
+                className={`mt-1 w-full text-xs py-1.5 rounded-lg font-semibold border transition-all flex items-center justify-center gap-1.5 ${showForecast ? 'bg-orange-500/15 border-orange-500/40 text-orange-400 hover:bg-orange-500/25' : 'bg-white/5 border-white/15 text-gray-400 hover:bg-white/10 hover:text-white'}`}
+              >
+                🔮 Congestion Forecast {showForecast ? 'ON' : 'OFF'}
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -1648,6 +2279,153 @@ export function CesiumViewer() {
             className="text-gray-500 hover:text-red-400 transition-all font-bold"
             title="Reset all to auto"
           >↺</button>
+        </div>
+      )}
+
+      {/* ── Vehicle incident panel ── */}
+      {selectedVehicleId && liveState === 'running' && (
+        <div className="absolute top-1/2 right-4 -translate-y-1/2 z-20 bg-gray-950/95 backdrop-blur-xl border border-orange-400/30 rounded-2xl px-4 py-3 shadow-2xl min-w-[200px]">
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-xs font-bold text-orange-300 tracking-wide">🚗 Vehicle Incident</span>
+            <button onClick={() => setSelectedVehicleId(null)} className="text-gray-500 hover:text-white text-xs">✕</button>
+          </div>
+          <p className="text-gray-500 text-[10px] mb-3 font-mono truncate">{selectedVehicleId}</p>
+
+          {activeIncidents.has(selectedVehicleId) ? (
+            <>
+              <div className="flex items-center gap-2 mb-3 bg-red-950/50 border border-red-500/30 rounded-xl px-3 py-2">
+                <span className="text-lg">
+                  {activeIncidents.get(selectedVehicleId)?.type === 'fire'      ? '🔥' :
+                   activeIncidents.get(selectedVehicleId)?.type === 'accident'  ? '💥' : '🔧'}
+                </span>
+                <div>
+                  <p className="text-red-300 text-xs font-bold capitalize">{activeIncidents.get(selectedVehicleId)?.type}</p>
+                  <p className="text-gray-500 text-[10px]">Traffic rerouting…</p>
+                </div>
+              </div>
+              <button
+                onClick={() => sendIncident(selectedVehicleId, 'clear')}
+                className="w-full text-xs py-1.5 rounded-lg bg-gray-700/50 border border-white/15 text-gray-300 hover:text-white hover:bg-white/10 transition-all font-semibold"
+              >
+                ✓ Clear Incident
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="text-gray-500 text-[10px] mb-2">Trigger scenario:</p>
+              <div className="flex flex-col gap-1.5">
+                {([
+                  { type: 'breakdown', label: '🔧 Breakdown',  cls: 'border-orange-500/40 text-orange-300 hover:bg-orange-900/30' },
+                  { type: 'accident',  label: '💥 Accident',   cls: 'border-purple-500/40 text-purple-300 hover:bg-purple-900/30' },
+                  { type: 'fire',      label: '🔥 Vehicle Fire', cls: 'border-red-500/40 text-red-300 hover:bg-red-900/30' },
+                ] as { type: string; label: string; cls: string }[]).map(s => (
+                  <button
+                    key={s.type}
+                    onClick={() => sendIncident(selectedVehicleId, s.type)}
+                    className={`text-xs py-1.5 rounded-lg bg-gray-900/80 border font-semibold transition-all ${s.cls}`}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── Active incidents badge ── */}
+      {liveState === 'running' && activeIncidents.size > 0 && (
+        <div className="absolute top-28 right-3 z-10 bg-red-950/90 backdrop-blur border border-red-500/40 rounded-xl px-3 py-1.5 text-xs">
+          <span className="text-red-300 font-bold">
+            ⚠️ {activeIncidents.size} active incident{activeIncidents.size > 1 ? 's' : ''}
+          </span>
+        </div>
+      )}
+
+      {/* ── Impact Analysis + Alternate Routes Panel ── */}
+      {altRoutesInfo && liveState === 'running' && (
+        <div className="absolute top-36 left-4 z-20 bg-gray-950/97 backdrop-blur-xl border border-cyan-400/30 rounded-2xl shadow-2xl w-72 overflow-hidden">
+          {/* Header */}
+          <div className="bg-cyan-950/60 border-b border-cyan-500/20 px-4 py-2.5 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🧠</span>
+              <span className="text-xs font-bold text-cyan-300 tracking-wide">Digital Twin — Impact Analysis</span>
+            </div>
+            <button onClick={() => setAltRoutesInfo(null)} className="text-gray-600 hover:text-white text-xs">✕</button>
+          </div>
+
+          {/* Stats row */}
+          <div className="grid grid-cols-3 gap-px bg-white/5 border-b border-white/10">
+            {[
+              { label: 'Affected', value: altRoutesInfo.affected, color: 'text-orange-400' },
+              { label: 'Rerouted', value: altRoutesInfo.rerouted, color: 'text-cyan-400' },
+              { label: 'Alt Paths', value: altRoutesInfo.altCount, color: 'text-emerald-400' },
+            ].map(s => (
+              <div key={s.label} className="bg-gray-950/80 px-3 py-2 text-center">
+                <p className={`text-lg font-bold font-mono ${s.color}`}>{s.value}</p>
+                <p className="text-gray-500 text-[10px]">{s.label}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Legend */}
+          <div className="px-4 py-3 space-y-2">
+            <p className="text-gray-400 text-[10px] font-semibold uppercase tracking-wider mb-1">Map Layers</p>
+            {[
+              { color: '#dc2626', label: 'Blocked road (incident)', dash: false },
+              { color: '#06b6d4', label: 'AI alternate corridors', dash: false },
+              { color: '#f97316', label: 'Predicted congestion spread', dash: true },
+              { color: '#fbbf24', label: 'Predicted slowdown', dash: true },
+            ].map(({ color, label, dash }) => (
+              <div key={label} className="flex items-center gap-2">
+                <div className="relative w-8 h-1.5 rounded flex-shrink-0 overflow-hidden">
+                  <div
+                    className="absolute inset-0 rounded"
+                    style={{
+                      background: color,
+                      opacity: 0.9,
+                      backgroundImage: dash ? `repeating-linear-gradient(90deg, ${color} 0px, ${color} 6px, transparent 6px, transparent 12px)` : undefined,
+                    }}
+                  />
+                </div>
+                <span className="text-gray-400 text-[10px]">{label}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Layer toggles */}
+          <div className="px-4 pb-3 flex gap-2">
+            <button
+              onClick={() => {
+                const next = !showAltRoutes
+                setShowAltRoutes(next)
+                if (!next) {
+                  altRouteEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+                  altRouteEntities.current = []
+                }
+              }}
+              className={`flex-1 text-[10px] py-1 rounded-lg border font-semibold transition-all ${
+                showAltRoutes ? 'bg-cyan-500/20 border-cyan-400/50 text-cyan-300' : 'bg-white/5 border-white/10 text-gray-500'
+              }`}
+            >
+              {showAltRoutes ? '✓' : '○'} Alt Routes
+            </button>
+            <button
+              onClick={() => {
+                const next = !showForecast
+                setShowForecast(next)
+                if (!next) {
+                  forecastEntities.current.forEach(e => cesiumViewer.current?.entities.remove(e))
+                  forecastEntities.current.clear()
+                }
+              }}
+              className={`flex-1 text-[10px] py-1 rounded-lg border font-semibold transition-all ${
+                showForecast ? 'bg-orange-500/20 border-orange-400/50 text-orange-300' : 'bg-white/5 border-white/10 text-gray-500'
+              }`}
+            >
+              {showForecast ? '✓' : '○'} Forecast
+            </button>
+          </div>
         </div>
       )}
 
