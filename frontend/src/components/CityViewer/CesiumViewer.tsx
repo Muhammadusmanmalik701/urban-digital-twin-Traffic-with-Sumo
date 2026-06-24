@@ -41,6 +41,7 @@ import { useBuildingStore } from '../../store/buildingStore'
 import { useLayerStore } from '../../store/layerStore'
 import { useMapControlStore } from '../../store/mapControlStore'
 import { api } from '../../services/api'
+import { HeatWaveLayer } from './HeatWaveLayer'
 
 const RAIN_AREA_BBOXES: Record<string, [number, number, number, number]> = {
   'Pessac':        [-0.636, 44.796, -0.596, 44.818],
@@ -2024,6 +2025,9 @@ export function CesiumViewer() {
   return (
     <div className="relative w-full h-full">
       <div ref={viewerRef} className="w-full h-full" />
+
+      {/* ── Heat Wave Layer ── */}
+      <HeatWaveLayer viewer={cesiumViewer.current} />
 
       {/* ── SUMO launch button (top-right of map) ── */}
       {!sim.loaded && liveState === 'idle' && (

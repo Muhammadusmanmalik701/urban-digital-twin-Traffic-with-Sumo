@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from app.services.climate_service import climate_service
 
 router = APIRouter(prefix="/climate", tags=["climate"])
@@ -13,6 +13,25 @@ async def get_current_climate():
 async def get_heat_zones():
     zones = await climate_service.get_heat_zones()
     return {"zones": zones}
+
+
+@router.get("/heatwave")
+async def get_heatwave_areas():
+    areas = await climate_service.get_heatwave_areas()
+    return {"areas": areas, "source": "Open-Meteo + UHI model"}
+
+
+@router.get("/intervention")
+async def get_intervention_impact(
+    area: str = Query(..., description="Area name"),
+    tree_cover_pct: float = Query(20, ge=0, le=100),
+    water_ha: float = Query(1.0, ge=0, le=50),
+    green_roof_pct: float = Query(5, ge=0, le=100),
+    cool_roof_pct: float = Query(5, ge=0, le=100),
+):
+    return await climate_service.get_intervention_impact(
+        area, tree_cover_pct, water_ha, green_roof_pct, cool_roof_pct
+    )
 
 
 @router.get("/air_quality")
