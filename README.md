@@ -2,6 +2,13 @@
 > AI-powered city intelligence platform for real-time urban simulation, resilience analysis, and adaptive decision support.
 
 Built phase-by-phase from a 1620-line master specification — integrating live SUMO/TraCI agent-based traffic simulation with a 3D CesiumJS geospatial interface, predictive congestion forecasting, and an AI-driven multi-criteria scenario engine.
+---
+<img width="1917" height="915" alt="image" src="https://github.com/user-attachments/assets/681ab36e-9106-48c3-8604-84a8d143e41f" />
+<img width="1917" height="900" alt="image" src="https://github.com/user-attachments/assets/648e1113-4e15-4ea7-a5ee-3bcf9959f825" />
+<img width="1917" height="907" alt="image" src="https://github.com/user-attachments/assets/971ba153-5d94-4ed7-9324-7ae92ec167dc" />
+<img width="1917" height="1020" alt="image" src="https://github.com/user-attachments/assets/513ee6da-8886-4fc0-b0d4-4892df93a56d" />
+<img width="1917" height="922" alt="image" src="https://github.com/user-attachments/assets/10e434c1-f9fe-4e96-9a13-057e01ad32e9" />
+
 
 ---
 
