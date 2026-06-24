@@ -686,4 +686,74 @@ _speed_history:   dict = {}   # { edge_id: [spd1, spd2, ...] } rolling window
 
 ---
 
-*Last updated: June 23 2026 | Author: UrbanTwin Dev*
+## 🌧 Session 7 — Area-Specific Rain Simulation + SUMO ego_car Fix (June 24 2026)
+
+### Goals
+- Fix SUMO duplicate vehicle ID error (`f_0.0`)
+- Add realistic rain effect with mm/hr controller for flood simulation
+- Rain drops, lightning, daylight reduction effects
+- Rain in layers panel (left sidebar toggle)
+- Area-specific rain simulation per Bordeaux zone
+
+---
+
+### SUMO Duplicate Vehicle ID Fix
+
+**Error**: `Another vehicle with the id 'f_0.0' exists. Quitting (on error)`
+
+**Root Cause**: `flow id="f_0"` auto-generates vehicles named `f_0.0`, `f_0.1`... and `routes.rou.xml` also had `trip id="f_0.0"` → name collision.
+
+**Fix**:
+- `simulations/sumo/routes.rou.xml`: renamed `trip id="f_0.0"` → `trip id="ego_car"`
+- `simulations/sumo/sumo_live_server.py`: `EGO_ID = "ego_car"`
+
+---
+
+### Rain Simulation System
+
+#### Architecture
+- **Layer toggle**: `showRain` added to `layerStore.ts` + `LayerTogglePanel.tsx`
+- **PostProcessStage GLSL shader** (CesiumJS 1.117 / WebGL2 / GLSL ES 3.0):
+  - Streak rain effect with 3 parallax layers
+  - Fog/tint overlay scaling with intensity
+  - `gl_FragCoord.xy / czm_viewport.zw` for UV (not `v_textureCoordinates`)
+  - `texture()` instead of `texture2D()`, `out_FragColor` instead of `gl_FragColor`
+- **Canvas animated drops**: `requestAnimationFrame` loop, lean angle `Math.PI/10`, wraps off-screen
+- **Lightning flash**: white overlay div, double-flash via `setTimeout`, triggers at ≥50mm
+- **Light dimming**: `viewer.scene.light.intensity = Math.max(0.25, 1.0 - mm/220)`
+- **Accumulation counter**: `setInterval` increments `mm/3600` per second
+
+#### GLSL Errors Fixed (3 iterations)
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `'varying' : Illegal use of reserved word` | GLSL ES 3.0 — `varying` removed | Delete `varying` declaration entirely |
+| `v_textureCoordinates undeclared` | CesiumJS 1.117 doesn't inject it in WebGL2 | Use `gl_FragCoord.xy / czm_viewport.zw` |
+| `texture2D not found`, `gl_FragColor undeclared` | GLSL ES 3.0 deprecations | Use `texture()` and `out_FragColor` |
+
+#### Area-Specific Rain (Mode: Global / By Area)
+- `RAIN_AREA_BBOXES` — lon/lat bounding boxes for 5 areas (Pessac, Talence, Mérignac, Bordeaux City, Gradignan)
+- Canvas drops clipped to screen-projected polygon via `scene.cartesianToCanvasCoordinates()` + `ctx.clip()`
+- `rainMode` state: `'global' | 'area'`
+- `areaRain` state: `Record<string, number>` per-area mm/hr
+- Refs mirror state for RAF loop access without stale closures
+
+#### Rain Panel UI (right sidebar, shown when Rain layer ON)
+- **Mode toggle**: 🌍 Global / 📍 By Area
+- **Global mode**: single 1-200mm/hr slider, 4 quick presets (Drizzle/Rain/Storm/Flood)
+- **Area mode**: per-area slider with individual flood risk badges (Watch/Warning/Emergency)
+- **Quick actions**: "All Rain" (set all to 30mm) / "Clear All"
+- **Effects badges**: Drops / Fog / Dim / Lightning — light up based on effective mm
+- **Flood warnings**: Watch (>60mm), Warning (>100mm), Emergency (>150mm)
+- **Accumulation counter** + reset button
+
+---
+
+### GitHub Commits
+```
+af40141 feat: area-specific rain simulation + SUMO ego_car fix
+4851da6 Merge branch 'main' of github.com:... (README additions from remote)
+```
+
+---
+
+*Last updated: June 24 2026 | Author: UrbanTwin Dev*
