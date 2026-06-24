@@ -10,6 +10,7 @@ interface LayerState {
   showScenarios: boolean
   showFloodRisk: boolean
   showGrid: boolean
+  showRain: boolean
   toggleLayer: (layer: keyof Omit<LayerState, 'toggleLayer'>) => void
   setLayer: (layer: keyof Omit<LayerState, 'toggleLayer'>, value: boolean) => void
 }
@@ -24,6 +25,7 @@ export const useLayerStore = create<LayerState>((set) => ({
   showScenarios: false,
   showFloodRisk: false,
   showGrid: false,
+  showRain: false,
   toggleLayer: (layer) => set((state) => ({ [layer]: !state[layer] })),
   setLayer: (layer, value) => set({ [layer]: value }),
 }))

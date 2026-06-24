@@ -34,12 +34,21 @@ const {
   ScreenSpaceEventType,
   Cartographic,
   UrlTemplateImageryProvider,
+  PostProcessStage,
 } = (window as any).Cesium
 import { useSimulationStore } from '../../store/simulationStore'
 import { useBuildingStore } from '../../store/buildingStore'
 import { useLayerStore } from '../../store/layerStore'
 import { useMapControlStore } from '../../store/mapControlStore'
 import { api } from '../../services/api'
+
+const RAIN_AREA_BBOXES: Record<string, [number, number, number, number]> = {
+  'Pessac':        [-0.636, 44.796, -0.596, 44.818],
+  'Talence':       [-0.605, 44.798, -0.570, 44.820],
+  'Mérignac':      [-0.720, 44.824, -0.660, 44.845],
+  'Bordeaux City': [-0.600, 44.826, -0.555, 44.852],
+  'Gradignan':     [-0.634, 44.762, -0.594, 44.782],
+}
 
 export const AREAS: Record<string, { lon: number; lat: number; height: number; osmName: string; icon: string }> = {
   'Pessac':        { lon: -0.6150, lat: 44.8060, height: 1600, osmName: 'Pessac',    icon: '🏘️' },
@@ -243,7 +252,7 @@ function getVehicleModel(vtype: string, vehicleId: string): VehicleModel {
   const t = (vtype || '').toLowerCase()
 
   // Ego car — gold highlight
-  if (vehicleId === 'f_0.0')
+  if (vehicleId === 'ego_car')
     return { uri: '/sumo/ferrari.glb', scale: 1.0, maxScale: 20,
              color: Color.fromCssColorString('#fbbf24'), blendAmount: 0.55 }
 
@@ -319,6 +328,17 @@ export function CesiumViewer() {
   const incidentEntities    = useRef<Map<string, any>>(new Map())
   const altRouteEntities    = useRef<any[]>([])
   const forecastEntities    = useRef<Map<string, any>>(new Map())
+  const rainStageRef        = useRef<any>(null)
+  const rainTimeRef         = useRef<number>(0)
+  const rainFrameRef        = useRef<any>(null)
+  const rainMmRef           = useRef<number>(0)
+  const rainCanvasRef       = useRef<HTMLCanvasElement | null>(null)
+  const rainAnimRef         = useRef<number>(0)
+  const lightningTimerRef   = useRef<any>(null)
+  const rainModeRef         = useRef<'global' | 'area'>('global')
+  const areaRainRef         = useRef<Record<string, number>>({})
+  const areaDropsRef        = useRef<Record<string, {x:number;y:number;spd:number;len:number;op:number}[]>>({})
+  const globalDropsRef      = useRef<{x:number;y:number;spd:number;len:number;op:number}[]>([])
 
   const [viewerReady, setViewerReady] = useState(false)
   const [sim, setSim] = useState<SimState>({
@@ -354,10 +374,15 @@ export function CesiumViewer() {
   const showForecastRef  = useRef(true)
   const [vrMode, setVrMode]           = useState(false)
   const [vrSupported, setVrSupported] = useState(false)
+  const [rainMm, setRainMm]           = useState(30)
+  const [rainMode, setRainMode]       = useState<'global' | 'area'>('global')
+  const [areaRain, setAreaRain]       = useState<Record<string, number>>({})
+  const [rainAccum, setRainAccum]     = useState(0)
+  const [lightningActive, setLightningActive] = useState(false)
 
   const { vehicles } = useSimulationStore()
   const { setSelectedBuilding } = useBuildingStore()
-  const { showTraffic, showBuildings } = useLayerStore()
+  const { showTraffic, showBuildings, showRain } = useLayerStore()
   const {
     flyTarget, loadTrigger, roadFilter, selectedAreas,
     toggleArea, flyToArea,
@@ -1630,7 +1655,7 @@ export function CesiumViewer() {
             sampledPos.forwardExtrapolationType = ExtrapolationType.HOLD
             sampledPos.backwardExtrapolationType = ExtrapolationType.HOLD
             sampledPos.addSample(jt, pos)
-            const isEgo = id === 'f_0.0'
+            const isEgo = id === 'ego_car'
             const vm    = getVehicleModel(vtype, id)
             const modelColor = isIncident
               ? Color.fromCssColorString('#6b7280').withAlpha(0.6)
@@ -1667,7 +1692,7 @@ export function CesiumViewer() {
           if (!activeIds.has(id)) {
             v.entities.remove(e)
             liveEntities.current.delete(id)
-            if (id === 'f_0.0') {
+            if (id === 'ego_car') {
               egoFollowedRef.current = false
               setEgoActive(false)
               stopFollow()
@@ -1798,6 +1823,202 @@ export function CesiumViewer() {
       try { v.scene.useWebVR = false } catch {}
     }
   }, [vrMode])
+
+  // ── Rain PostProcessStage — created once after viewer ready ───────────────
+  useEffect(() => {
+    if (!viewerReady) return
+    const v = cesiumViewer.current
+    if (!v) return
+
+    const glsl = `
+      uniform sampler2D colorTexture;
+      uniform float rainIntensity;
+      uniform float rainTime;
+
+      float h21(vec2 p) {
+        p = fract(p * vec2(234.34, 435.345));
+        p += dot(p, p + 34.23);
+        return fract(p.x * p.y);
+      }
+
+      void main() {
+        vec2 uv = gl_FragCoord.xy / czm_viewport.zw;
+        vec4 col = texture(colorTexture, uv);
+        if (rainIntensity <= 0.0) { out_FragColor = col; return; }
+
+        float streak = 0.0;
+        for (int i = 0; i < 3; i++) {
+          float sc = (1.0 + float(i) * 0.75) * 38.0 * clamp(rainIntensity, 0.05, 1.0);
+          vec2 ru = uv * vec2(sc, sc * 2.6);
+          ru.y -= rainTime * (2.8 + rainIntensity * 4.5 + float(i) * 0.7);
+          vec2 g = floor(ru); vec2 c = fract(ru);
+          float xo = (h21(g + 13.7) - 0.5) * 0.32;
+          float d = smoothstep(0.038, 0.0, abs(c.x - 0.5 + xo));
+          d *= smoothstep(0.0, 0.18, c.y) * smoothstep(1.0, 0.78, c.y);
+          streak += d * step(0.42, h21(g + float(i) * 7.3)) * 0.20 / (float(i) + 1.0);
+        }
+
+        float fog = rainIntensity * 0.40;
+        vec3 fc = vec3(0.60, 0.64, 0.72);
+        vec3 tinted = mix(col.rgb, col.rgb * vec3(0.86, 0.91, 1.04), rainIntensity * 0.28);
+        vec3 out3 = mix(tinted, fc, fog) + vec3(0.70, 0.80, 0.96) * streak * rainIntensity;
+        out_FragColor = vec4(out3, col.a);
+      }
+    `
+
+    const stage = new PostProcessStage({
+      fragmentShader: glsl,
+      uniforms: {
+        rainIntensity: () => rainMmRef.current / 150.0,
+        rainTime:      () => rainTimeRef.current,
+      },
+    })
+    v.scene.postProcessStages.add(stage)
+    rainStageRef.current = stage
+
+    const tick = () => { rainTimeRef.current += 0.018 }
+    v.scene.preRender.addEventListener(tick)
+    rainFrameRef.current = tick
+
+    return () => {
+      try { v.scene.postProcessStages.remove(stage) } catch {}
+      try { v.scene.preRender.removeEventListener(tick) } catch {}
+      rainStageRef.current = null
+      rainFrameRef.current = null
+    }
+  }, [viewerReady]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Sync rain state to refs (read by animation loop & GLSL uniform) ────────
+  useEffect(() => {
+    rainModeRef.current = rainMode
+    areaRainRef.current = areaRain
+    const mm = rainMode === 'global' ? rainMm : Math.max(0, ...Object.values(areaRain), 0)
+    rainMmRef.current = showRain ? mm : 0
+  }, [rainMm, rainMode, areaRain, showRain])
+
+  // ── Canvas rain drops (global + area-clipped) ─────────────────────────────
+  useEffect(() => {
+    if (!showRain) {
+      cancelAnimationFrame(rainAnimRef.current)
+      const c = rainCanvasRef.current
+      if (c) { c.getContext('2d')?.clearRect(0, 0, c.width, c.height) }
+      return
+    }
+    const canvas = rainCanvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')!
+    const lean = Math.PI / 10
+
+    const mkDrop = (w: number, h: number, mm: number) => ({
+      x: Math.random() * w, y: Math.random() * h,
+      spd: 10 + Math.random() * 14 + mm / 18,
+      len: 12 + Math.random() * 22 + mm / 12,
+      op:  0.25 + Math.random() * 0.45,
+    })
+
+    const drawDrop = (d: ReturnType<typeof mkDrop>) => {
+      ctx.strokeStyle = `rgba(180,215,245,${d.op})`
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(d.x, d.y)
+      ctx.lineTo(d.x + d.len * Math.sin(lean), d.y + d.len * Math.cos(lean))
+      ctx.stroke()
+      d.x += d.spd * Math.sin(lean)
+      d.y += d.spd * Math.cos(lean)
+    }
+
+    const draw = () => {
+      canvas.width  = canvas.parentElement?.clientWidth  ?? 1920
+      canvas.height = canvas.parentElement?.clientHeight ?? 1080
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      const W = canvas.width, H = canvas.height
+
+      if (rainModeRef.current === 'global') {
+        const mm = rainMmRef.current
+        if (mm > 0) {
+          const need = Math.min(600, Math.floor(mm * 2.5 + 60))
+          while (globalDropsRef.current.length < need) globalDropsRef.current.push(mkDrop(W, H, mm))
+          if (globalDropsRef.current.length > need) globalDropsRef.current.length = need
+          globalDropsRef.current.forEach(d => {
+            drawDrop(d)
+            if (d.y > H || d.x > W) { d.y = -d.len; d.x = Math.random() * W }
+          })
+        }
+      } else {
+        // Area-specific: project each area bbox → canvas clip → draw drops inside
+        const v = cesiumViewer.current
+        if (v) {
+          Object.entries(areaRainRef.current).forEach(([name, mm]) => {
+            if (!mm || mm <= 0) { delete areaDropsRef.current[name]; return }
+            const bbox = RAIN_AREA_BBOXES[name]
+            if (!bbox) return
+            const [w0, s, e, n] = bbox
+            const corners = [
+              [w0, s], [e, s], [e, n], [w0, n],
+            ].map(([lon, lat]) => {
+              try { return v.scene.cartesianToCanvasCoordinates(Cartesian3.fromDegrees(lon, lat, 0)) }
+              catch { return null }
+            }).filter(Boolean) as {x:number;y:number}[]
+            if (corners.length < 3) return
+
+            const need = Math.min(400, Math.floor(mm * 2 + 50))
+            if (!areaDropsRef.current[name] || areaDropsRef.current[name].length !== need)
+              areaDropsRef.current[name] = Array.from({length: need}, () => mkDrop(W, H, mm))
+
+            ctx.save()
+            ctx.beginPath()
+            ctx.moveTo(corners[0].x, corners[0].y)
+            corners.slice(1).forEach(c => ctx.lineTo(c.x, c.y))
+            ctx.closePath()
+            ctx.clip()
+            areaDropsRef.current[name].forEach(d => {
+              drawDrop(d)
+              if (d.y > H || d.x > W) { d.y = -d.len; d.x = Math.random() * W }
+            })
+            ctx.restore()
+          })
+        }
+      }
+      rainAnimRef.current = requestAnimationFrame(draw)
+    }
+    rainAnimRef.current = requestAnimationFrame(draw)
+    return () => cancelAnimationFrame(rainAnimRef.current)
+  }, [showRain]) // reads mode/mm from refs inside loop
+
+  // ── Lightning — triggers when effective mm ≥ 50 ───────────────────────────
+  useEffect(() => {
+    const mm = rainMode === 'global' ? rainMm : Math.max(0, ...Object.values(areaRain), 0)
+    if (!showRain || mm < 50) {
+      clearTimeout(lightningTimerRef.current); setLightningActive(false); return
+    }
+    const flash = () => {
+      setLightningActive(true)
+      setTimeout(() => {
+        setLightningActive(false)
+        setTimeout(() => {
+          if (Math.random() > 0.5) { setLightningActive(true); setTimeout(() => setLightningActive(false), 80 + Math.random() * 80) }
+        }, 120)
+      }, 60 + Math.random() * 100)
+      lightningTimerRef.current = setTimeout(flash, 4000 + Math.random() * (mm >= 100 ? 5000 : 10000))
+    }
+    lightningTimerRef.current = setTimeout(flash, 2000 + Math.random() * 4000)
+    return () => clearTimeout(lightningTimerRef.current)
+  }, [showRain, rainMm, rainMode, areaRain])
+
+  // ── Scene light dimming ────────────────────────────────────────────────────
+  useEffect(() => {
+    const v = cesiumViewer.current; if (!v) return
+    const mm = rainMode === 'global' ? rainMm : Math.max(0, ...Object.values(areaRain), 0)
+    try { v.scene.light.intensity = showRain ? Math.max(0.25, 1.0 - mm / 220) : 1.0 } catch {}
+  }, [showRain, rainMm, rainMode, areaRain])
+
+  // ── Rain accumulation ──────────────────────────────────────────────────────
+  useEffect(() => {
+    const mm = rainMode === 'global' ? rainMm : Math.max(0, ...Object.values(areaRain), 0)
+    if (!showRain || mm === 0) return
+    const id = setInterval(() => setRainAccum(a => parseFloat((a + mm / 3600).toFixed(2))), 1000)
+    return () => clearInterval(id)
+  }, [showRain, rainMm, rainMode, areaRain])
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -2045,6 +2266,191 @@ export function CesiumViewer() {
           </div>
         </div>
       )}
+
+      {/* ── Rain canvas drops overlay ── */}
+      {showRain && (
+        <canvas
+          ref={rainCanvasRef}
+          className="absolute inset-0 pointer-events-none"
+          style={{ zIndex: 6, opacity: Math.min(1, 0.4 + rainMm / 300) }}
+        />
+      )}
+
+      {/* ── Lightning flash overlay ── */}
+      {lightningActive && (
+        <div
+          className="absolute inset-0 pointer-events-none"
+          style={{ zIndex: 7, background: 'rgba(220,235,255,0.55)', transition: 'opacity 0.05s' }}
+        />
+      )}
+
+      {/* ── Rain Simulation Panel ── */}
+      {showRain && (() => {
+        const getRainInfo = (mm: number) => {
+          if (mm <= 0)   return { label: 'Off',        icon: '☁️', color: 'text-gray-500',   risk: null }
+          if (mm <= 5)   return { label: 'Drizzle',    icon: '🌦', color: 'text-sky-300',    risk: null }
+          if (mm <= 15)  return { label: 'Light',      icon: '🌧', color: 'text-blue-300',   risk: null }
+          if (mm <= 30)  return { label: 'Moderate',   icon: '🌧', color: 'text-blue-400',   risk: null }
+          if (mm <= 60)  return { label: 'Heavy',      icon: '⛈', color: 'text-amber-300',  risk: 'watch' }
+          if (mm <= 100) return { label: 'Very Heavy', icon: '⛈', color: 'text-orange-400', risk: 'warning' }
+          return             { label: 'Extreme',   icon: '🌊', color: 'text-red-400',    risk: 'flood' }
+        }
+        const effectiveMm = rainMode === 'global' ? rainMm : Math.max(0, ...Object.values(areaRain), 0)
+        const globalInfo  = getRainInfo(rainMm)
+
+        return (
+          <div className="absolute top-1/2 -translate-y-1/2 right-4 z-20 bg-gray-950/97 backdrop-blur-xl border border-blue-400/30 rounded-2xl shadow-2xl w-72 overflow-hidden max-h-[90vh] overflow-y-auto">
+            {/* Header */}
+            <div className="bg-blue-950/60 border-b border-blue-500/20 px-4 py-2.5 flex items-center gap-2 sticky top-0">
+              <span className="text-blue-300 font-bold text-xs tracking-wide">🌧 Rain Simulator</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+            </div>
+
+            <div className="px-4 py-3 space-y-3">
+              {/* Mode toggle */}
+              <div className="flex gap-1 p-0.5 bg-white/5 rounded-xl">
+                {(['global', 'area'] as const).map(m => (
+                  <button
+                    key={m}
+                    onClick={() => setRainMode(m)}
+                    className={`flex-1 text-[10px] py-1.5 rounded-lg font-bold transition-all capitalize ${
+                      rainMode === m
+                        ? 'bg-blue-500/30 border border-blue-400/50 text-blue-200'
+                        : 'text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    {m === 'global' ? '🌍 Global' : '📍 By Area'}
+                  </button>
+                ))}
+              </div>
+
+              {/* ── GLOBAL MODE ── */}
+              {rainMode === 'global' && (
+                <>
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-[10px] text-gray-500 uppercase tracking-wide">Intensity</span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-bold font-mono text-white">{rainMm}</span>
+                        <span className="text-gray-600 text-[10px]">mm/hr</span>
+                      </div>
+                    </div>
+                    <input type="range" min="1" max="200" step="1" value={rainMm}
+                      onChange={e => setRainMm(Number(e.target.value))}
+                      className="w-full h-1.5 rounded-full appearance-none cursor-pointer"
+                      style={{ background: `linear-gradient(to right,#3b82f6 ${rainMm/2}%,#1e293b ${rainMm/2}%)` }}
+                    />
+                    <div className="flex justify-between mt-0.5">
+                      {['1','50','100','150','200'].map(v => <span key={v} className="text-[9px] text-gray-700">{v}</span>)}
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between bg-white/4 rounded-xl px-3 py-2">
+                    <span className={`text-sm font-bold ${globalInfo.color}`}>{globalInfo.icon} {globalInfo.label}</span>
+                    {rainAccum > 0 && (
+                      <div className="text-right">
+                        <div className="text-[10px] text-gray-500">Accumulated</div>
+                        <div className="text-xs font-bold font-mono text-white">{rainAccum.toFixed(1)} mm</div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-1">
+                    {[{mm:5,label:'Drizzle'},{mm:30,label:'Rain'},{mm:80,label:'Storm'},{mm:150,label:'Flood'}].map(p => (
+                      <button key={p.mm} onClick={() => setRainMm(p.mm)}
+                        className={`flex-1 text-[9px] py-1 rounded-lg border font-semibold transition-all ${rainMm===p.mm?'bg-blue-500/25 border-blue-400/60 text-blue-300':'bg-white/4 border-white/10 text-gray-500 hover:text-gray-300'}`}
+                      >{p.label}</button>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {/* ── AREA MODE ── */}
+              {rainMode === 'area' && (
+                <div className="space-y-2">
+                  {Object.keys(AREAS).map(areaName => {
+                    const mm = areaRain[areaName] ?? 0
+                    const info = getRainInfo(mm)
+                    return (
+                      <div key={areaName} className={`rounded-xl border px-3 py-2 transition-all ${mm > 0 ? 'bg-blue-950/30 border-blue-500/30' : 'bg-white/3 border-white/8'}`}>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[10px] font-semibold text-gray-300">
+                            {AREAS[areaName].icon} {areaName}
+                          </span>
+                          <span className={`text-[10px] font-bold ${info.color}`}>
+                            {info.icon} {mm > 0 ? `${mm} mm/hr` : 'Off'}
+                          </span>
+                        </div>
+                        <input type="range" min="0" max="200" step="1" value={mm}
+                          onChange={e => setAreaRain(prev => ({ ...prev, [areaName]: Number(e.target.value) }))}
+                          className="w-full h-1 rounded-full appearance-none cursor-pointer"
+                          style={{ background: mm > 0 ? `linear-gradient(to right,#3b82f6 ${mm/2}%,#1e293b ${mm/2}%)` : '#1e293b' }}
+                        />
+                        {info.risk === 'watch'   && <p className="text-amber-400 text-[9px] mt-1">⚠️ Flood Watch</p>}
+                        {info.risk === 'warning' && <p className="text-orange-400 text-[9px] mt-1">🚨 Flood Warning</p>}
+                        {info.risk === 'flood'   && <p className="text-red-400 text-[9px] mt-1 animate-pulse">🌊 Flood Emergency</p>}
+                      </div>
+                    )
+                  })}
+                  {/* Area quick presets */}
+                  <div className="flex gap-1 pt-1">
+                    <button onClick={() => setAreaRain(Object.fromEntries(Object.keys(AREAS).map(k => [k, 30])))}
+                      className="flex-1 text-[9px] py-1 rounded-lg border border-blue-500/30 text-blue-400 hover:bg-blue-900/20 transition-all">
+                      All Rain
+                    </button>
+                    <button onClick={() => setAreaRain({})}
+                      className="flex-1 text-[9px] py-1 rounded-lg border border-white/10 text-gray-500 hover:text-gray-300 transition-all">
+                      Clear All
+                    </button>
+                  </div>
+                  {rainAccum > 0 && (
+                    <div className="flex items-center justify-between bg-white/4 rounded-xl px-3 py-1.5">
+                      <span className="text-[10px] text-gray-500">Accumulated</span>
+                      <span className="text-xs font-bold font-mono text-white">{rainAccum.toFixed(1)} mm</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Shared: effects badges */}
+              <div className="flex flex-wrap gap-1">
+                {[
+                  { label: '💧 Drops', on: effectiveMm > 0 },
+                  { label: '🌫 Fog',   on: effectiveMm > 0 },
+                  { label: '🌑 Dim',   on: effectiveMm > 10 },
+                  { label: '⚡ Lightning', on: effectiveMm >= 50 },
+                ].map(e => (
+                  <span key={e.label} className={`text-[9px] px-2 py-0.5 rounded-full border ${e.on ? 'border-blue-500/40 text-blue-300 bg-blue-950/40' : 'border-white/10 text-gray-700'}`}>
+                    {e.label}
+                  </span>
+                ))}
+              </div>
+
+              {/* Global flood risk (shown only in global mode) */}
+              {rainMode === 'global' && globalInfo.risk === 'watch' && (
+                <div className="bg-amber-950/60 border border-amber-500/40 rounded-xl px-3 py-2">
+                  <p className="text-amber-300 text-[10px] font-bold">⚠️ FLOOD WATCH — Possible road ponding</p>
+                </div>
+              )}
+              {rainMode === 'global' && globalInfo.risk === 'warning' && (
+                <div className="bg-orange-950/60 border border-orange-500/50 rounded-xl px-3 py-2">
+                  <p className="text-orange-300 text-[10px] font-bold">🚨 FLOOD WARNING — Road submersion likely</p>
+                </div>
+              )}
+              {rainMode === 'global' && globalInfo.risk === 'flood' && (
+                <div className="bg-red-950/70 border border-red-500/60 rounded-xl px-3 py-2 animate-pulse">
+                  <p className="text-red-300 text-[10px] font-bold">🌊 FLOOD EMERGENCY — Evacuation zones at risk</p>
+                </div>
+              )}
+
+              {rainAccum > 0 && rainMode === 'global' && (
+                <button onClick={() => setRainAccum(0)}
+                  className="w-full text-[10px] py-1 rounded-lg border border-white/10 text-gray-600 hover:text-gray-300 transition-all">
+                  ↺ Reset accumulation
+                </button>
+              )}
+            </div>
+          </div>
+        )
+      })()}
 
       {/* ── Isochrone pick hint ── */}
       {isoMode && (

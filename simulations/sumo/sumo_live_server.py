@@ -63,7 +63,7 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 WS_PORT = 8765
 SUMOCFG = "sim.sumocfg"
-EGO_ID  = "f_0.0"
+EGO_ID  = "ego_car"
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 CLIENTS: set = set()

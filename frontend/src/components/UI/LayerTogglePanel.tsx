@@ -10,6 +10,7 @@ const LAYERS = [
   { key: 'showScenarios', label: 'Scenarios', icon: '🎭' },
   { key: 'showFloodRisk', label: 'Flood Risk', icon: '🌊' },
   { key: 'showGrid', label: 'Energy Grid', icon: '🔌' },
+  { key: 'showRain', label: 'Rain Simulation', icon: '🌧' },
 ] as const
 
 export function LayerTogglePanel() {
