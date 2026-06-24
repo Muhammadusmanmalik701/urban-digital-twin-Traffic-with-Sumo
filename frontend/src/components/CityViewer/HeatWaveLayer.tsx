@@ -11,90 +11,41 @@ const AREA_POLYGONS: Record<string, [number, number][]> = {
   'Gradignan':     [[-0.650,44.755],[-0.580,44.755],[-0.580,44.790],[-0.650,44.790]],
 }
 
+// Hot/cool micro-spots for each area (real Bordeaux geography)
 const HEAT_SPOTS: Record<string, { lon: number; lat: number; delta: number; radius: number }[]> = {
   'Bordeaux City': [
-    { lon: -0.574, lat: 44.836, delta: +3.2, radius: 280 },
-    { lon: -0.567, lat: 44.841, delta: +2.5, radius: 200 },
-    { lon: -0.593, lat: 44.830, delta: +2.0, radius: 220 },
-    { lon: -0.582, lat: 44.844, delta: -2.2, radius: 350 },
-    { lon: -0.554, lat: 44.852, delta: -3.5, radius: 400 },
+    { lon: -0.574, lat: 44.836, delta: +3.2, radius: 280 }, // Gare Saint-Jean
+    { lon: -0.567, lat: 44.841, delta: +2.5, radius: 200 }, // Place de la Victoire
+    { lon: -0.593, lat: 44.830, delta: +2.0, radius: 220 }, // Cours de la Marne
+    { lon: -0.582, lat: 44.844, delta: -2.2, radius: 350 }, // Jardin Public
+    { lon: -0.554, lat: 44.852, delta: -3.5, radius: 400 }, // Garonne waterfront
   ],
   'Mérignac': [
-    { lon: -0.710, lat: 44.829, delta: +4.0, radius: 500 },
-    { lon: -0.685, lat: 44.835, delta: +3.0, radius: 350 },
-    { lon: -0.658, lat: 44.848, delta: -2.2, radius: 400 },
+    { lon: -0.710, lat: 44.829, delta: +4.0, radius: 500 }, // Airport runways
+    { lon: -0.685, lat: 44.835, delta: +3.0, radius: 350 }, // Industrial ZAC
+    { lon: -0.668, lat: 44.840, delta: +2.0, radius: 250 }, // Commercial N230
+    { lon: -0.658, lat: 44.848, delta: -2.2, radius: 400 }, // Parc du Bocage
+    { lon: -0.695, lat: 44.818, delta: -1.5, radius: 300 }, // Parc des Jalles
   ],
   'Pessac': [
-    { lon: -0.610, lat: 44.808, delta: +2.2, radius: 300 },
-    { lon: -0.625, lat: 44.800, delta: +1.8, radius: 250 },
-    { lon: -0.603, lat: 44.815, delta: -1.8, radius: 350 },
+    { lon: -0.610, lat: 44.808, delta: +2.2, radius: 300 }, // University concrete
+    { lon: -0.625, lat: 44.800, delta: +1.8, radius: 250 }, // Commercial strip
+    { lon: -0.603, lat: 44.815, delta: -1.8, radius: 350 }, // Campus park
+    { lon: -0.615, lat: 44.820, delta: -1.2, radius: 280 }, // Parc de Camponac
   ],
   'Talence': [
-    { lon: -0.593, lat: 44.812, delta: -3.0, radius: 400 },
-    { lon: -0.580, lat: 44.806, delta: +2.0, radius: 220 },
-    { lon: -0.600, lat: 44.818, delta: -1.5, radius: 300 },
+    { lon: -0.593, lat: 44.812, delta: -3.0, radius: 400 }, // Parc Peixotto
+    { lon: -0.580, lat: 44.806, delta: +2.0, radius: 220 }, // Dense residential
+    { lon: -0.568, lat: 44.810, delta: +1.8, radius: 200 }, // Cours du Médoc
+    { lon: -0.600, lat: 44.818, delta: -1.5, radius: 300 }, // University green
   ],
   'Gradignan': [
-    { lon: -0.618, lat: 44.767, delta: -4.0, radius: 600 },
-    { lon: -0.606, lat: 44.778, delta: +1.8, radius: 200 },
-    { lon: -0.628, lat: 44.773, delta: -2.5, radius: 350 },
+    { lon: -0.618, lat: 44.767, delta: -4.0, radius: 600 }, // Forêt de Gradignan
+    { lon: -0.606, lat: 44.778, delta: +1.8, radius: 200 }, // Town centre
+    { lon: -0.628, lat: 44.773, delta: -2.5, radius: 350 }, // La Jalle river
+    { lon: -0.598, lat: 44.785, delta: -1.2, radius: 300 }, // Suburban gardens
   ],
 }
-
-// ── Animated heat wave GLSL shader (GLSL ES 3.0 / CesiumJS 1.117) ──────────
-// Creates multi-octave animated color gradient over the scene.
-// Color: cyan (cool) → green → yellow → orange → red → purple (extreme)
-const HEAT_WAVE_SHADER = `
-  uniform sampler2D colorTexture;
-  uniform float heatTime;
-  uniform float heatIntensity;
-
-  vec3 heatGradient(float t) {
-    t = clamp(t, 0.0, 1.0);
-    if (t < 0.167) return mix(vec3(0.13,0.83,0.94), vec3(0.29,0.87,0.50), t * 6.0);
-    if (t < 0.333) return mix(vec3(0.29,0.87,0.50), vec3(0.98,0.94,0.14), (t-0.167) * 6.0);
-    if (t < 0.500) return mix(vec3(0.98,0.94,0.14), vec3(0.98,0.55,0.09), (t-0.333) * 6.0);
-    if (t < 0.667) return mix(vec3(0.98,0.55,0.09), vec3(0.94,0.13,0.13), (t-0.500) * 6.0);
-    if (t < 0.833) return mix(vec3(0.94,0.13,0.13), vec3(0.73,0.05,0.10), (t-0.667) * 6.0);
-    return           mix(vec3(0.73,0.05,0.10), vec3(0.49,0.23,0.93), (t-0.833) * 6.0);
-  }
-
-  void main() {
-    vec2 uv = gl_FragCoord.xy / czm_viewport.zw;
-    float t  = heatTime;
-    float px = uv.x;
-    float py = uv.y;
-
-    // Multi-octave slow-moving heat pattern (large scale = geographic zones)
-    float n1 = sin(px * 4.5  + t * 0.22) * cos(py * 3.8  + t * 0.18);
-    float n2 = cos(px * 7.3  - t * 0.16) * sin(py * 6.1  + t * 0.20);
-    float n3 = sin((px * 0.8 + py * 1.2) * 5.8 + t * 0.13);
-    float n4 = cos(px * 3.2  + py * 4.7  + t * 0.25) * 0.45;
-    // Fine vertical shimmer columns (heat rising from streets)
-    float cols = sin(px * 55.0 + t * 0.4) * 0.08;
-
-    float pattern = (n1*0.32 + n2*0.28 + n3*0.24 + n4*0.10 + cols*0.06) * 0.5 + 0.5;
-
-    // Slow breathing pulse
-    float pulse = sin(t * 0.7) * 0.05 + cos(t * 1.1) * 0.04;
-    float heat  = clamp(pattern * 0.88 + pulse + 0.12, 0.0, 1.0);
-
-    // Heat haze shimmer distortion (vertical ripple like hot air)
-    float shimX = sin(py * 42.0 + t * 2.6) * cos(py * 19.0 + t * 1.3) * 0.0025 * heatIntensity;
-    float shimY = cos(px * 34.0 + t * 2.1) * sin(px * 23.0 + t * 1.7) * 0.0018 * heatIntensity;
-    vec4 dist   = texture(colorTexture, uv + vec2(shimX, shimY));
-
-    // Color + alpha
-    vec3 heatCol = heatGradient(heat * heatIntensity);
-    float alpha  = (0.26 + heat * 0.26) * heatIntensity;
-
-    // Darken original slightly for contrast, then add heat glow
-    vec3 darkened = dist.rgb * (1.0 - alpha * 0.35);
-    vec3 result   = mix(darkened, heatCol, alpha);
-
-    out_FragColor = vec4(result, dist.a);
-  }
-`
 
 interface AreaData {
   name: string; lat: number; lon: number; type: string
@@ -192,6 +143,10 @@ function getRisk(t: number): string {
   return 'Emergency'
 }
 
+function hexToRgb(hex: string): [number, number, number] {
+  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)]
+}
+
 function posNoise(lon: number, lat: number): number {
   const s = Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453
   return (s - Math.floor(s) - 0.5) * 2.4
@@ -216,27 +171,25 @@ function tempToColor(t: number): [number, number, number, number] {
 function buildHeatGrid(area: AreaData): { lon: number; lat: number; temp: number }[] {
   const poly  = AREA_POLYGONS[area.name]
   if (!poly) return []
-  const lons  = poly.map(p => p[0])
-  const lats  = poly.map(p => p[1])
+  const lons  = poly.map(p => p[0]), lats = poly.map(p => p[1])
   const spots = HEAT_SPOTS[area.name] ?? []
   const STEP  = 0.0018
-
   const pts: { lon: number; lat: number; temp: number }[] = []
-  for (let lon = Math.min(...lons) + STEP / 2; lon < Math.max(...lons); lon += STEP)
-    for (let lat = Math.min(...lats) + STEP / 2; lat < Math.max(...lats); lat += STEP)
-      pts.push({ lon, lat, temp: area.temp_c + posNoise(lon, lat) + spots.reduce((a, s) => a + spotInfluence(lon, lat, s), 0) })
+  for (let lon = Math.min(...lons) + STEP/2; lon < Math.max(...lons); lon += STEP)
+    for (let lat = Math.min(...lats) + STEP/2; lat < Math.max(...lats); lat += STEP)
+      pts.push({ lon, lat, temp: area.temp_c + posNoise(lon, lat) + spots.reduce((a,s) => a + spotInfluence(lon,lat,s), 0) })
   return pts
 }
 
 export function HeatWaveLayer({ viewer }: { viewer: any }) {
   const { showHeatWave } = useLayerStore()
 
+  const canvasRef    = useRef<HTMLCanvasElement | null>(null)
+  const rafRef       = useRef<number>(0)
+  const selectedRef  = useRef<AreaData | null>(null)
   const polyEntRef   = useRef<any[]>([])
   const labelEntRef  = useRef<any[]>([])
   const heatPrimRef  = useRef<any>(null)
-  const postStageRef = useRef<any>(null)
-  const heatTimeRef  = useRef(0)
-  const rafRef       = useRef<number>(0)
   const intervalRef  = useRef<any>(null)
 
   const [areas, setAreas]           = useState<AreaData[]>([])
@@ -246,7 +199,10 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
   const [simResult, setSimResult]   = useState<SimResult | null>(null)
   const [lastUpdate, setLastUpdate] = useState('')
 
-  // ── Fetch / fallback ────────────────────────────────────────────────────────
+  // Keep ref in sync for RAF access
+  useEffect(() => { selectedRef.current = selected }, [selected])
+
+  // ── Fetch areas ─────────────────────────────────────────────────────────────
   const fetchAreas = useCallback(async () => {
     try {
       const r = await fetch(`${API}/climate/heatwave`, { signal: AbortSignal.timeout(5000) })
@@ -267,51 +223,152 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
     return () => clearInterval(intervalRef.current)
   }, [showHeatWave, fetchAreas])
 
-  // ── Animated PostProcessStage — heat wave shader ────────────────────────────
+  // ── Canvas heat animation — ONLY on selected area ───────────────────────────
   useEffect(() => {
-    if (!viewer) return
+    if (!viewer || !showHeatWave) {
+      cancelAnimationFrame(rafRef.current)
+      return
+    }
+
     const Cesium = (window as any).Cesium
 
-    // Remove old stage + stop animation
-    if (postStageRef.current) {
-      try { viewer.scene.postProcessStages.remove(postStageRef.current) } catch { /* already removed */ }
-      postStageRef.current = null
-    }
-    cancelAnimationFrame(rafRef.current)
+    const draw = () => {
+      const canvas = canvasRef.current
+      const sel    = selectedRef.current
+      if (!canvas) { rafRef.current = requestAnimationFrame(draw); return }
 
-    if (!showHeatWave) return
+      // Sync canvas pixel size to container
+      const parent = canvas.parentElement
+      if (parent) {
+        if (canvas.width  !== parent.clientWidth)  canvas.width  = parent.clientWidth
+        if (canvas.height !== parent.clientHeight) canvas.height = parent.clientHeight
+      }
 
-    try {
-      const stage = new Cesium.PostProcessStage({
-        fragmentShader: HEAT_WAVE_SHADER,
-        uniforms: {
-          heatTime:      () => heatTimeRef.current,
-          heatIntensity: () => 0.88,
-        },
+      const ctx = canvas.getContext('2d')!
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+      // No area selected → clear (street dots still visible)
+      if (!sel) { rafRef.current = requestAnimationFrame(draw); return }
+
+      const poly = AREA_POLYGONS[sel.name]
+      if (!poly) { rafRef.current = requestAnimationFrame(draw); return }
+
+      // Project area polygon corners to screen pixels
+      const pts = poly.map(([lon, lat]) => {
+        try { return viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(lon, lat, 30)) }
+        catch { return null }
+      }).filter(Boolean) as { x: number; y: number }[]
+
+      if (pts.length < 3) { rafRef.current = requestAnimationFrame(draw); return }
+
+      const t = performance.now() / 1000
+      const w = canvas.width, h = canvas.height
+      const [br, bg, bb] = hexToRgb(sel.color)
+
+      ctx.save()
+
+      // ── Clip to projected area polygon ──────────────────────────────────────
+      ctx.beginPath()
+      ctx.moveTo(pts[0].x, pts[0].y)
+      pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y))
+      ctx.closePath()
+      ctx.clip()
+
+      // ── 1. Base semi-transparent heat fill ──────────────────────────────────
+      ctx.fillStyle = `rgba(${br},${bg},${bb},0.14)`
+      ctx.fillRect(0, 0, w, h)
+
+      // ── 2. Animated rising heat bands (vertical shimmer) ────────────────────
+      const bandH = h * 0.18
+      const scroll = (t * 28) % (bandH * 2)
+      for (let by = -bandH * 2 + scroll; by < h + bandH; by += bandH * 2) {
+        const bAlpha = 0.07 + Math.sin(t * 0.9 + by * 0.005) * 0.025
+        const bGrad = ctx.createLinearGradient(0, by, 0, by + bandH)
+        bGrad.addColorStop(0,   `rgba(255,160,20,0)`)
+        bGrad.addColorStop(0.5, `rgba(255,160,20,${bAlpha.toFixed(3)})`)
+        bGrad.addColorStop(1,   `rgba(255,160,20,0)`)
+        ctx.fillStyle = bGrad
+        ctx.fillRect(0, by, w, bandH)
+      }
+
+      // ── 3. Hot/cool spot radial gradients at real geographic positions ──────
+      const spots = HEAT_SPOTS[sel.name] ?? []
+      spots.forEach(spot => {
+        let sp: { x: number; y: number } | null = null
+        try { sp = viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(spot.lon, spot.lat, 30)) }
+        catch { return }
+        if (!sp) return
+
+        const pulse  = 1 + Math.sin(t * 1.3 + spot.lon * 7) * 0.13
+        const pxRad  = (Math.abs(spot.delta) * 32 + 85) * pulse
+        const grad   = ctx.createRadialGradient(sp.x, sp.y, 0, sp.x, sp.y, pxRad)
+
+        if (spot.delta >= 3.5) {         // extreme hot (airport tarmac, dense city)
+          grad.addColorStop(0,   `rgba(124,58,237,0.75)`)  // purple core
+          grad.addColorStop(0.25,`rgba(239,68,68, 0.60)`)  // red
+          grad.addColorStop(0.6, `rgba(249,115,22,0.30)`)  // orange fade
+          grad.addColorStop(1,   `rgba(249,115,22,0)`)
+        } else if (spot.delta >= 2) {    // hot
+          grad.addColorStop(0,   `rgba(239,68,68, 0.65)`)
+          grad.addColorStop(0.4, `rgba(249,115,22,0.40)`)
+          grad.addColorStop(0.8, `rgba(250,204,21,0.15)`)
+          grad.addColorStop(1,   `rgba(250,204,21,0)`)
+        } else if (spot.delta > 0) {     // warm
+          grad.addColorStop(0,   `rgba(249,115,22,0.50)`)
+          grad.addColorStop(0.5, `rgba(250,204,21,0.25)`)
+          grad.addColorStop(1,   `rgba(250,204,21,0)`)
+        } else if (spot.delta <= -3) {   // very cool (forest, river, water)
+          grad.addColorStop(0,   `rgba(34,211,238,0.70)`)  // cyan core
+          grad.addColorStop(0.35,`rgba(74,222,128,0.45)`)  // green
+          grad.addColorStop(0.7, `rgba(74,222,128,0.18)`)
+          grad.addColorStop(1,   `rgba(74,222,128,0)`)
+        } else {                         // cool (park, garden)
+          grad.addColorStop(0,   `rgba(74,222,128,0.55)`)
+          grad.addColorStop(0.5, `rgba(34,211,238,0.25)`)
+          grad.addColorStop(1,   `rgba(34,211,238,0)`)
+        }
+
+        ctx.fillStyle = grad
+        ctx.fillRect(0, 0, w, h)
       })
-      viewer.scene.postProcessStages.add(stage)
-      postStageRef.current = stage
 
-      // Drive heatTime uniform via rAF
-      const tick = (ts: number) => {
-        heatTimeRef.current = ts / 1000
-        rafRef.current = requestAnimationFrame(tick)
-      }
-      rafRef.current = requestAnimationFrame(tick)
-    } catch (e) {
-      console.warn('Heat wave PostProcessStage failed:', e)
+      // ── 4. Animated pulsing wave overlay ────────────────────────────────────
+      const waveAlpha = 0.04 + Math.sin(t * 0.7) * 0.02
+      const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length
+      const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length
+      const maxR = Math.max(...pts.map(p => Math.hypot(p.x - cx, p.y - cy))) * 1.2
+      const wGrad = ctx.createRadialGradient(cx, cy, maxR * 0.2, cx, cy, maxR)
+      wGrad.addColorStop(0,   `rgba(${br},${bg},${bb},0)`)
+      wGrad.addColorStop(0.6, `rgba(${br},${bg},${bb},${waveAlpha.toFixed(3)})`)
+      wGrad.addColorStop(1,   `rgba(${br},${bg},${bb},${(waveAlpha * 1.5).toFixed(3)})`)
+      ctx.fillStyle = wGrad
+      ctx.fillRect(0, 0, w, h)
+
+      ctx.restore()
+
+      // ── 5. Glowing pulsing border (outside clip) ────────────────────────────
+      const glow  = 0.55 + Math.sin(t * 1.8) * 0.25
+      const gHex  = Math.round(glow * 255).toString(16).padStart(2,'0')
+      ctx.save()
+      ctx.beginPath()
+      ctx.moveTo(pts[0].x, pts[0].y)
+      pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y))
+      ctx.closePath()
+      ctx.shadowColor  = sel.color
+      ctx.shadowBlur   = 18
+      ctx.strokeStyle  = `${sel.color}${gHex}`
+      ctx.lineWidth    = 3
+      ctx.stroke()
+      ctx.restore()
+
+      rafRef.current = requestAnimationFrame(draw)
     }
 
-    return () => {
-      if (postStageRef.current) {
-        try { viewer.scene.postProcessStages.remove(postStageRef.current) } catch { /* ok */ }
-        postStageRef.current = null
-      }
-      cancelAnimationFrame(rafRef.current)
-    }
+    rafRef.current = requestAnimationFrame(draw)
+    return () => cancelAnimationFrame(rafRef.current)
   }, [viewer, showHeatWave])
 
-  // ── Area polygon outlines + labels ──────────────────────────────────────────
+  // ── Area polygon outlines + floating labels ──────────────────────────────────
   useEffect(() => {
     if (!viewer) return
     const Cesium = (window as any).Cesium
@@ -328,19 +385,17 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
       if (!poly) return
       const positions = poly.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat))
 
-      // Thin border only — shader handles fill
       polyEntRef.current.push(viewer.entities.add({
         polygon: {
           hierarchy: new Cesium.PolygonHierarchy(positions),
-          material: Cesium.Color.fromCssColorString(area.color).withAlpha(0.08),
+          material: Cesium.Color.fromCssColorString(area.color).withAlpha(0.06),
           outline: true,
-          outlineColor: Cesium.Color.fromCssColorString(area.color).withAlpha(0.90),
-          outlineWidth: 3,
+          outlineColor: Cesium.Color.fromCssColorString(area.color).withAlpha(0.55),
+          outlineWidth: 2,
           heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
         },
       }))
 
-      // Floating label
       labelEntRef.current.push(viewer.entities.add({
         position: Cesium.Cartesian3.fromDegrees(area.lon, area.lat, 250),
         label: {
@@ -360,46 +415,37 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
     })
   }, [viewer, showHeatWave, areas])
 
-  // ── Street-level heat dot grid (geographic accuracy) ───────────────────────
+  // ── Street-level heat dot grid ───────────────────────────────────────────────
   useEffect(() => {
     if (!viewer) return
     const Cesium = (window as any).Cesium
 
-    if (heatPrimRef.current) {
-      viewer.scene.primitives.remove(heatPrimRef.current)
-      heatPrimRef.current = null
-    }
+    if (heatPrimRef.current) { viewer.scene.primitives.remove(heatPrimRef.current); heatPrimRef.current = null }
     if (!showHeatWave || !areas.length) return
 
     const col = new Cesium.PointPrimitiveCollection()
     areas.forEach(area => {
       buildHeatGrid(area).forEach(({ lon, lat, temp }) => {
         const [r, g, b, a] = tempToColor(temp)
-        col.add({
-          position:  Cesium.Cartesian3.fromDegrees(lon, lat, 5),
-          color:     new Cesium.Color(r / 255, g / 255, b / 255, a),
-          pixelSize: 11,
-        })
+        col.add({ position: Cesium.Cartesian3.fromDegrees(lon, lat, 5), color: new Cesium.Color(r/255, g/255, b/255, a), pixelSize: 10 })
       })
     })
     viewer.scene.primitives.add(col)
     heatPrimRef.current = col
   }, [viewer, showHeatWave, areas])
 
-  // ── Full cleanup ────────────────────────────────────────────────────────────
+  // ── Full cleanup on layer off ────────────────────────────────────────────────
   useEffect(() => {
     if (!showHeatWave && viewer) {
+      cancelAnimationFrame(rafRef.current)
       polyEntRef.current.forEach(e => viewer.entities.remove(e))
       labelEntRef.current.forEach(e => viewer.entities.remove(e))
-      polyEntRef.current  = []
-      labelEntRef.current = []
+      polyEntRef.current = []; labelEntRef.current = []
       if (heatPrimRef.current) { viewer.scene.primitives.remove(heatPrimRef.current); heatPrimRef.current = null }
-      if (postStageRef.current) { try { viewer.scene.postProcessStages.remove(postStageRef.current) } catch { /* ok */ }; postStageRef.current = null }
-      cancelAnimationFrame(rafRef.current)
     }
   }, [showHeatWave, viewer])
 
-  // ── Reactive ML sim (pure frontend) ────────────────────────────────────────
+  // ── Reactive ML sim (pure frontend) ─────────────────────────────────────────
   useEffect(() => {
     if (!selected || !simMode) { setSimResult(null); return }
     const reduction = Math.max(0,
@@ -421,15 +467,23 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
 
   return (
     <>
+      {/* ── Full-screen canvas (area-clipped heat animation) ── */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 w-full h-full pointer-events-none"
+        style={{ zIndex: 10 }}
+      />
+
       {/* ── Bottom area cards ── */}
       {!selected && (
         <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2">
+          <div className="text-[10px] text-gray-500 text-center">Click an area to see heat wave</div>
           <div className="flex gap-2">
             {areas.map(a => (
               <button key={a.name}
                 onClick={() => { setSelected(a); setSimMode(false); setSimSliders({ tree_cover_pct: 0, water_ha: 0, green_roof_pct: 0, cool_roof_pct: 0 }) }}
                 className="flex flex-col items-center gap-0.5 px-3 py-2 rounded-xl border backdrop-blur-lg transition-all hover:scale-105 active:scale-95"
-                style={{ backgroundColor: `${a.color}18`, borderColor: `${a.color}55` }}
+                style={{ backgroundColor: `${a.color}15`, borderColor: `${a.color}55` }}
               >
                 <span className="text-[10px] text-gray-400 font-medium">{a.name}</span>
                 <span className="text-xl font-black" style={{ color: a.color }}>{a.temp_c}°C</span>
@@ -437,22 +491,16 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
               </button>
             ))}
           </div>
-
           {/* Color legend */}
-          {areas.length > 0 && (
-            <div className="flex items-center gap-1.5 bg-gray-950/85 backdrop-blur px-3 py-1.5 rounded-xl border border-white/10">
-              {[
-                ['#22d3ee','<38°C'],['#4ade80','39°C'],['#facc15','41°C'],
-                ['#f97316','42°C'],['#ef4444','44°C'],['#7c3aed','45+°C'],
-              ].map(([c, l]) => (
-                <div key={l} className="flex items-center gap-1">
-                  <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: c }} />
-                  <span className="text-[9px] text-gray-500">{l}</span>
-                </div>
-              ))}
-              {lastUpdate && <span className="text-[9px] text-gray-600 ml-1">🌡 {lastUpdate}</span>}
-            </div>
-          )}
+          <div className="flex items-center gap-1.5 bg-gray-950/85 backdrop-blur px-3 py-1.5 rounded-xl border border-white/10">
+            {([['#22d3ee','<38°C'],['#4ade80','39°C'],['#facc15','41°C'],['#f97316','42°C'],['#ef4444','44°C'],['#7c3aed','45+°C']] as const).map(([c,l]) => (
+              <div key={l} className="flex items-center gap-1">
+                <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: c }} />
+                <span className="text-[9px] text-gray-500">{l}</span>
+              </div>
+            ))}
+            {lastUpdate && <span className="text-[9px] text-gray-600 ml-1">🌡 {lastUpdate}</span>}
+          </div>
         </div>
       )}
 
@@ -488,12 +536,11 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
             <div className="bg-green-950/50 border border-green-500/30 rounded-xl px-3 py-2">
               <div className="text-[10px] text-green-400 font-bold">🌱 Max achievable cooling</div>
               <div className="flex justify-between items-center mt-1">
-                <span className="text-white text-sm font-bold">↓ {selected.max_achievable_reduction_c}°C possible</span>
+                <span className="text-white text-sm font-bold">↓ {selected.max_achievable_reduction_c}°C</span>
                 <span className="text-green-300 font-bold">{selected.potential_temp_c}°C potential</span>
               </div>
             </div>
 
-            {/* Tab toggle */}
             <div className="flex gap-1 p-0.5 bg-white/5 rounded-xl">
               {([{v: false, l: '🤖 AI Suggestions'},{v: true, l: '🧪 What-If Sim'}] as const).map(m => (
                 <button key={String(m.v)} onClick={() => setSimMode(m.v)}
@@ -503,7 +550,6 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
               ))}
             </div>
 
-            {/* AI Suggestions */}
             {!simMode && (
               <div className="space-y-2">
                 <div className="text-[10px] text-gray-500 uppercase tracking-wide">Evidence-based interventions</div>
@@ -526,16 +572,14 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
               </div>
             )}
 
-            {/* What-If Sim */}
             {simMode && (
               <div className="space-y-3">
                 <div className="text-[10px] text-gray-500 uppercase tracking-wide">Sliders → live ML prediction ↓</div>
-
                 {([
-                  { key: 'tree_cover_pct', label: '🌳 Tree Cover',    unit: '%',  max: 60, step: 1,   coeff: 0.05  },
-                  { key: 'water_ha',       label: '💧 Water Bodies',  unit: 'ha', max: 20, step: 0.5, coeff: 0.35  },
-                  { key: 'green_roof_pct', label: '🌿 Green Roofs',   unit: '%',  max: 80, step: 1,   coeff: 0.025 },
-                  { key: 'cool_roof_pct',  label: '🏚 Cool Roofs',    unit: '%',  max: 80, step: 1,   coeff: 0.018 },
+                  { key: 'tree_cover_pct', label: '🌳 Tree Cover',   unit: '%',  max: 60, step: 1,   coeff: 0.05  },
+                  { key: 'water_ha',       label: '💧 Water Bodies', unit: 'ha', max: 20, step: 0.5, coeff: 0.35  },
+                  { key: 'green_roof_pct', label: '🌿 Green Roofs',  unit: '%',  max: 80, step: 1,   coeff: 0.025 },
+                  { key: 'cool_roof_pct',  label: '🏚 Cool Roofs',   unit: '%',  max: 80, step: 1,   coeff: 0.018 },
                 ] as const).map(s => {
                   const val = simSliders[s.key]
                   const impact = +(val * s.coeff).toFixed(2)
@@ -557,7 +601,6 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
                   )
                 })}
 
-                {/* Live result */}
                 {simResult && simResult.reduction_c > 0 ? (
                   <div className={`rounded-xl border px-4 py-3 ${RISK_BG[simResult.risk_after]}`}>
                     <div className="text-[10px] text-gray-400 mb-2">📊 ML Prediction (live)</div>
