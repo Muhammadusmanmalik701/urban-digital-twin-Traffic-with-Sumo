@@ -26,6 +26,71 @@ interface InterventionResult {
   reduction_c: number; risk_before: string; risk_after: string; model: string
 }
 
+// Fallback data (used when backend is offline) — based on UHI research + typical Bordeaux heat wave
+const FALLBACK_AREAS: AreaData[] = [
+  {
+    name: 'Bordeaux City', lat: 44.838, lon: -0.579, type: 'dense_urban',
+    temp_c: 44.0, feels_like_c: 51.2, humidity_pct: 35, uhi_delta_c: 4.0,
+    risk: 'Extreme', color: '#ef4444',
+    baseline: { tree_cover_pct: 15, water_ha: 3.5, green_roof_pct: 2, cool_roof_pct: 6 },
+    interventions: [
+      { action: 'Double canopy on Cours de la Marne & Victor Hugo', impact_c: 0.9, cost: 'Medium', timeline: '5 yrs' },
+      { action: 'Garonne riverfront park expansion (+3 ha)', impact_c: 1.1, cost: 'Medium', timeline: '2 yrs' },
+      { action: 'Mandatory white roofs on new construction', impact_c: 0.7, cost: 'None (policy)', timeline: 'Immediate' },
+      { action: 'Underground cisterns at 8 carparks → fountains', impact_c: 1.3, cost: 'High', timeline: '2-3 yrs' },
+    ],
+    max_achievable_reduction_c: 4.0, potential_temp_c: 40.0, source: 'Fallback — start backend for live data',
+  },
+  {
+    name: 'Mérignac', lat: 44.833, lon: -0.685, type: 'industrial_airport',
+    temp_c: 43.0, feels_like_c: 49.8, humidity_pct: 35, uhi_delta_c: 3.0,
+    risk: 'Extreme', color: '#ef4444',
+    baseline: { tree_cover_pct: 12, water_ha: 0.5, green_roof_pct: 1, cool_roof_pct: 8 },
+    interventions: [
+      { action: 'Industrial roof whitening (3 km²)', impact_c: 1.8, cost: 'Low', timeline: '6 months' },
+      { action: 'Airport perimeter forest belt (5 km)', impact_c: 2.1, cost: 'High', timeline: '5-10 yrs' },
+      { action: 'Retention basin at ZAC aéroparc (5 ha)', impact_c: 1.5, cost: 'High', timeline: '3-4 yrs' },
+    ],
+    max_achievable_reduction_c: 5.4, potential_temp_c: 37.6, source: 'Fallback — start backend for live data',
+  },
+  {
+    name: 'Pessac', lat: 44.806, lon: -0.615, type: 'suburban_university',
+    temp_c: 41.5, feels_like_c: 47.3, humidity_pct: 37, uhi_delta_c: 1.5,
+    risk: 'Extreme', color: '#f97316',
+    baseline: { tree_cover_pct: 22, water_ha: 1.2, green_roof_pct: 3, cool_roof_pct: 5 },
+    interventions: [
+      { action: 'Plant 2,000 trees along campus corridors', impact_c: 1.2, cost: 'Low', timeline: '3-5 yrs' },
+      { action: 'Create 3 retention ponds (1 ha each)', impact_c: 0.9, cost: 'Medium', timeline: '1-2 yrs' },
+      { action: 'Green roofs on university buildings', impact_c: 0.5, cost: 'Medium', timeline: '2-3 yrs' },
+    ],
+    max_achievable_reduction_c: 2.6, potential_temp_c: 38.9, source: 'Fallback — start backend for live data',
+  },
+  {
+    name: 'Talence', lat: 44.808, lon: -0.589, type: 'suburban_park',
+    temp_c: 41.0, feels_like_c: 46.5, humidity_pct: 38, uhi_delta_c: 1.0,
+    risk: 'Extreme', color: '#f97316',
+    baseline: { tree_cover_pct: 30, water_ha: 2.0, green_roof_pct: 4, cool_roof_pct: 4 },
+    interventions: [
+      { action: 'Expand Parc Peixotto by 2 ha + water feature', impact_c: 1.0, cost: 'Low', timeline: '1 yr' },
+      { action: 'Cool paving on 4 main streets', impact_c: 0.6, cost: 'Medium', timeline: '6 months' },
+      { action: 'Misting systems at 5 public squares', impact_c: 0.8, cost: 'Low', timeline: '3 months' },
+    ],
+    max_achievable_reduction_c: 2.4, potential_temp_c: 38.6, source: 'Fallback — start backend for live data',
+  },
+  {
+    name: 'Gradignan', lat: 44.772, lon: -0.616, type: 'forest_edge',
+    temp_c: 40.0, feels_like_c: 44.8, humidity_pct: 40, uhi_delta_c: 0.0,
+    risk: 'Danger', color: '#f59e0b',
+    baseline: { tree_cover_pct: 45, water_ha: 4.0, green_roof_pct: 2, cool_roof_pct: 3 },
+    interventions: [
+      { action: 'Protect existing forest — zero-construction buffer', impact_c: 0.0, cost: 'None (policy)', timeline: 'Immediate' },
+      { action: 'Restore La Jalle river natural meanders (3 km)', impact_c: 0.8, cost: 'Medium', timeline: '2 yrs' },
+      { action: 'Agro-forestry corridors linking forest patches', impact_c: 0.5, cost: 'Low', timeline: '3-5 yrs' },
+    ],
+    max_achievable_reduction_c: 1.3, potential_temp_c: 38.7, source: 'Fallback — start backend for live data',
+  },
+]
+
 const RISK_COLORS: Record<string, string> = {
   Normal: '#3b82f6', Caution: '#f59e0b', Danger: '#f97316', Extreme: '#ef4444', Emergency: '#7c3aed'
 }
@@ -54,12 +119,15 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
 
   const fetchAreas = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/climate/heatwave`)
-      if (!r.ok) return
+      const r = await fetch(`${API}/climate/heatwave`, { signal: AbortSignal.timeout(5000) })
+      if (!r.ok) throw new Error('not ok')
       const d = await r.json()
-      setAreas(d.areas ?? [])
-      setLastUpdate(new Date().toLocaleTimeString('fr-FR'))
-    } catch { /* backend offline */ }
+      setAreas(d.areas ?? FALLBACK_AREAS)
+      setLastUpdate(new Date().toLocaleTimeString('fr-FR') + ' (live)')
+    } catch {
+      setAreas(FALLBACK_AREAS)
+      setLastUpdate(new Date().toLocaleTimeString('fr-FR') + ' (offline)')
+    }
   }, [])
 
   // Draw polygons + labels on CesiumJS

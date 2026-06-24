@@ -2027,7 +2027,7 @@ export function CesiumViewer() {
       <div ref={viewerRef} className="w-full h-full" />
 
       {/* ── Heat Wave Layer ── */}
-      <HeatWaveLayer viewer={cesiumViewer.current} />
+      {viewerReady && <HeatWaveLayer viewer={cesiumViewer.current} />}
 
       {/* ── SUMO launch button (top-right of map) ── */}
       {!sim.loaded && liveState === 'idle' && (
