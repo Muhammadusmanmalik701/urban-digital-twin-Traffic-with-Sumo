@@ -47,6 +47,7 @@ import { BuildingInspector } from './BuildingInspector'
 import { HeatShimmerLayer } from './HeatShimmerLayer'
 import { SatelliteLSTLayer } from './SatelliteLSTLayer'
 import { StreetHeatLayer } from './StreetHeatLayer'
+import { BuildingThermalLayer } from './BuildingThermalLayer'
 
 const RAIN_AREA_BBOXES: Record<string, [number, number, number, number]> = {
   'Pessac':        [-0.636, 44.796, -0.596, 44.818],
@@ -2048,6 +2049,9 @@ export function CesiumViewer() {
 
       {/* ── Street Heat Network (georeferenced road-level thermal) ── */}
       {viewerReady && <StreetHeatLayer viewer={cesiumViewer.current} />}
+
+      {/* ── Building Thermal Layer (tint + aura from street/heat wave temp) ── */}
+      {viewerReady && <BuildingThermalLayer viewer={cesiumViewer.current} osmBuildingsRef={osmBuildings} />}
 
       {/* ── SUMO launch button (top-right of map) ── */}
       {!sim.loaded && liveState === 'idle' && (

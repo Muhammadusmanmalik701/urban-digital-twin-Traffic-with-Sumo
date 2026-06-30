@@ -303,6 +303,7 @@ export function StreetHeatLayer({ viewer }: { viewer: any }) {
         lat: GRID_PTS[i].lat, lon: GRID_PTS[i].lon,
         temp: d.current?.temperature_2m ?? 28,
       }))
+      store.setLiveGrid(gridRef.current)
       store.setStatus('live')
       store.setUpdatedAt(new Date().toLocaleTimeString('fr-FR', {hour:'2-digit', minute:'2-digit'}))
     } catch {

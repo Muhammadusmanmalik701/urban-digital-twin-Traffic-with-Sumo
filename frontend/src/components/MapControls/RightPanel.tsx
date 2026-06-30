@@ -5,6 +5,7 @@ import { useBuildingInspectorStore } from '../../store/buildingInspectorStore'
 import { useLayerStore } from '../../store/layerStore'
 import { useStreetHeatStore, HistoricalDay, ForecastDay } from '../../store/streetHeatStore'
 import { useSatelliteLSTStore, LSTMode } from '../../store/satelliteLSTStore'
+import { computeLocalAirTemp, dynamicEnergyClass, tempToIntensity } from '../../utils/thermalUtils'
 
 // ── Street Heat colormap ──────────────────────────────────────────────────────
 const RAMP: [number,[number,number,number]][] = [
@@ -306,39 +307,104 @@ function SatelliteLSTPanel() {
 function BuildingInspectorPanel() {
   const building    = useBuildingInspectorStore(s => s.building)
   const setBuilding = useBuildingInspectorStore(s => s.setBuilding)
-  const { showBuildings } = useLayerStore()
+  const { showBuildings, showStreetHeat, showHeatWave } = useLayerStore()
+  const { liveGrid } = useStreetHeatStore()
+
   if (!building || !showBuildings) return null
   const b = building
   const netGreen = Math.max(0, Math.round((b.uhiC-b.greenRoofReducC)*10)/10)
   const netCool  = Math.max(0, Math.round((b.uhiC-b.coolRoofReducC)*10)/10)
+
+  // Dynamic energy class — computed from local air temp when heat data is active
+  const heatActive   = (showStreetHeat || showHeatWave) && liveGrid.length > 0
+  const localAirTemp = heatActive ? computeLocalAirTemp(b.lon, b.lat, liveGrid) : null
+  const dynEc        = localAirTemp !== null
+    ? dynamicEnergyClass(b.consumptionPerM2, localAirTemp)
+    : null
+  const thermalIntensity = localAirTemp !== null ? tempToIntensity(localAirTemp, 20, 45) : 0
+
+  // Thermal stress label
+  const stressLabel =
+    thermalIntensity > 0.75 ? { text: 'Extreme Heat Stress', color: '#ef4444' } :
+    thermalIntensity > 0.50 ? { text: 'High Heat Stress',    color: '#f97316' } :
+    thermalIntensity > 0.25 ? { text: 'Moderate Thermal Load', color: '#eab308' } :
+                              { text: 'Low Thermal Load',    color: '#34d399' }
+
   return (
     <Section icon="🏢" title="Building Inspector" color="#60a5fa" defaultOpen>
+      {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <div>
           <div className="text-[10px] font-bold text-white">{b.type}</div>
-          <div className="text-[8px] text-gray-500">{b.district}</div>
+          <div className="text-[8px] text-gray-500">{b.district} · {b.floors}F · ~{b.yearBuilt}</div>
         </div>
         <button onClick={()=>setBuilding(null)}
           className="w-5 h-5 rounded bg-white/6 hover:bg-white/15 text-gray-500 hover:text-white text-[10px] flex items-center justify-center transition-all">✕</button>
       </div>
-      <div className="flex flex-wrap gap-1 mb-2">
-        {[`${b.floors}F`,`~${b.yearBuilt}`,`${b.footprintM2.toLocaleString()}m²`].map(t=>(
-          <span key={t} className="bg-white/5 border border-white/8 rounded px-1.5 py-0.5 text-[8px] text-gray-400">{t}</span>
-        ))}
-      </div>
-      <div className="flex items-center gap-2 mb-2">
-        <div className="w-6 h-6 rounded-lg flex items-center justify-center text-[10px] font-black"
-          style={{background:`${b.energyColor}22`,color:b.energyColor,border:`1.5px solid ${b.energyColor}44`}}>
-          {b.energyCls}
+
+      {/* Thermal stress banner (only when heat active) */}
+      {localAirTemp !== null && (
+        <div className="rounded-lg border px-2.5 py-1.5 mb-2.5 flex items-center gap-2.5"
+          style={{borderColor:`${stressLabel.color}40`, background:`${stressLabel.color}12`}}>
+          <div className="flex-1">
+            <div className="text-[9px] font-bold" style={{color:stressLabel.color}}>{stressLabel.text}</div>
+            <div className="text-[7px] text-gray-500 mt-0.5">Local air temp: <span className="font-bold text-white">{localAirTemp}°C</span></div>
+          </div>
+          {/* Thermal intensity bar */}
+          <div className="w-12 h-1.5 rounded-full bg-white/10 overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-500"
+              style={{width:`${thermalIntensity*100}%`, background:`linear-gradient(to right,#22d3ee,${stressLabel.color})`}}/>
+          </div>
         </div>
-        <div>
-          <div className="text-xs font-black text-white">{b.consumptionPerM2} <span className="text-[7px] text-gray-500">kWh/m²/yr</span></div>
-          <div className="text-[7px] text-gray-500">{fmtKwh(b.totalKwh)}/yr · {b.co2Tonnes}t CO₂</div>
+      )}
+
+      {/* Energy class — static vs dynamic side by side when heat active */}
+      <div className={`flex gap-2 mb-2 ${dynEc ? '' : ''}`}>
+        {/* Static (rated) class */}
+        <div className="flex-1 rounded-lg border border-white/6 bg-white/3 px-2 py-1.5">
+          <div className="text-[6px] text-gray-600 mb-1 uppercase tracking-wider">Rated</div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-5 h-5 rounded flex items-center justify-center text-[9px] font-black flex-shrink-0"
+              style={{background:`${b.energyColor}22`,color:b.energyColor,border:`1.5px solid ${b.energyColor}44`}}>
+              {b.energyCls}
+            </div>
+            <div>
+              <div className="text-[10px] font-black text-white">{b.consumptionPerM2}</div>
+              <div className="text-[6px] text-gray-600">kWh/m²/yr</div>
+            </div>
+          </div>
         </div>
+
+        {/* Dynamic (heat-adjusted) class */}
+        {dynEc && (
+          <div className="flex-1 rounded-lg border px-2 py-1.5"
+            style={{borderColor:`${dynEc.color}40`, background:`${dynEc.color}10`}}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[6px] uppercase tracking-wider" style={{color:dynEc.color}}>Heat Adjusted</div>
+              {dynEc.cls !== b.energyCls && (
+                <span className="text-[6px] font-bold text-orange-400 animate-pulse">▲ degraded</span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-5 h-5 rounded flex items-center justify-center text-[9px] font-black flex-shrink-0"
+                style={{background:`${dynEc.color}22`,color:dynEc.color,border:`1.5px solid ${dynEc.color}44`}}>
+                {dynEc.cls}
+              </div>
+              <div>
+                <div className="text-[10px] font-black" style={{color:dynEc.color}}>{dynEc.kwh}</div>
+                <div className="text-[6px] text-gray-600">+{dynEc.penaltyPct}% penalty</div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
+
+      <div className="text-[7px] text-gray-600 mb-2.5">{fmtKwh(b.totalKwh)}/yr · {b.co2Tonnes}t CO₂ · {b.footprintM2.toLocaleString()} m²</div>
+
+      {/* UHI + interventions */}
       <div className="flex items-end gap-3 mb-2">
         <div>
-          <div className="text-[6px] text-gray-600">UHI</div>
+          <div className="text-[6px] text-gray-600">UHI contrib.</div>
           <div className="text-base font-black text-orange-400">+{b.uhiC}°C</div>
         </div>
         <div className="flex-1 space-y-0.5">
@@ -352,10 +418,14 @@ function BuildingInspectorPanel() {
           </div>
         </div>
       </div>
+
+      {/* Solar bar */}
       <div className="h-1 rounded-full bg-white/8 overflow-hidden">
         <div className="h-full rounded-full" style={{width:`${b.solarOffsetPct}%`,background:b.solarOffsetPct>50?'#22c55e':'#f97316'}}/>
       </div>
-      <div className="text-[7px] text-right mt-0.5" style={{color:b.solarOffsetPct>50?'#4ade80':'#fb923c'}}>{b.solarOffsetPct}% solar offset · {fmtKwh(b.solarKwhYear)}/yr</div>
+      <div className="text-[7px] text-right mt-0.5" style={{color:b.solarOffsetPct>50?'#4ade80':'#fb923c'}}>
+        {b.solarOffsetPct}% solar offset · {fmtKwh(b.solarKwhYear)}/yr
+      </div>
     </Section>
   )
 }
