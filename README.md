@@ -14,6 +14,32 @@ Built phase-by-phase from a 1620-line master specification — integrating live 
 
 ## ✨ Key Features
 
+### 🌡️ Street-Level Thermal Network (NEW)
+- **44,133 road segments** colored by surface temperature — real OSM geometry, not screen overlay
+- World-space `GroundPolylinePrimitive` — drapes on terrain, moves with 3D globe correctly
+- Temperature model per road: `IDW(live air temp) + road_delta + UHI_zone - park_cooling + noise`
+  - Motorways: +8.2°C above ambient · Residential: +3.0°C (Falda et al. 2025 methodology)
+  - 5 UHI zones: Bordeaux City +4°C, Mérignac +3°C, Gradignan 0°C
+  - 10 park cooling zones (Parc Bordelais −2.8°C etc.) — NDVI proxy from paper
+  - Time-of-day factor: peaks 14:00, troughs ~02:00
+- **RdYlBu colormap:** 22°C (deep blue) → 37°C (yellow) → 56°C (dark red) — same as QGIS/Landsat output
+- **Area filtering:** only loads roads for selected communes
+- **Auto-refresh** every 30 min with live Open-Meteo API temperatures
+
+### 📊 Historical + Forecast + Anomaly Data (NEW)
+- **30-day history** from Open-Meteo Archive API (ERA5 reanalysis, free, no auth)
+- **7-day forecast** with WMO weather codes → emoji icons ☀️⛅🌦️⛈️❄️
+- **Anomaly detection:** current 7-day mean vs same period last year → 🔥 +2.3°C / ❄️ −1.1°C badge
+- Interactive SVG sparkline with min/max range fill — no chart library dependency
+- All data loaded in parallel (`Promise.all`) — non-blocking behind road layer
+
+### 🛰️ Satellite LST Layer (NEW)
+- **Open-Meteo batch API** — 20-point 5×4 grid over Bordeaux Métropole
+- **Canvas Gaussian heatmap** — σ=120px interpolation matching paper's spatial continuity
+- **3 view modes:** 🌡️ LST (surface temp) · 🌿 NDVI (vegetation) · 🏙️ NDBI (built-up)
+- **NASA GIBS WMS overlay** — MODIS Terra 1 km daily satellite imagery on Cesium globe
+- **Paper interventions (Falda et al. 2025):** Green roofs −0.7°C · Cool asphalt −1.9°C simulation
+
 ### 🚗 Live SUMO/TraCI Traffic Simulation
 - 300+ vehicles streaming in real-time via WebSocket
 - Ego car (`f_0.0`) with full keyboard control — W/S/A/D/Space/R
@@ -94,9 +120,11 @@ PostGIS (port 5432) · TimescaleDB (port 5433) · Redis
 | Simulation | SUMO · TraCI · sumo-gui |
 | Databases | PostGIS · TimescaleDB · Redis |
 | Infrastructure | Docker Compose (12 services) · Nginx |
-| Geospatial | Overpass API · Mapbox Isochrone API · Cesium Ion |
+| Geospatial | Overpass API · Mapbox Isochrone API · Cesium Ion · NASA GIBS |
+| Climate Data | Open-Meteo Forecast API · Open-Meteo Archive API (ERA5) |
 | XR | WebXR API · HTC Vive Cosmos Elite |
 | 3D Assets | Ferrari GLB · Truck GLB · Draco Compression |
+| Road Data | OSM GeoJSON via Overpass (44,133 segments · 5 communes) |
 
 ---
 
@@ -162,12 +190,14 @@ docker-compose up --build
 
 ## 🔮 Roadmap
 
+- [x] ~~Street-Level Thermal Network~~ — ✅ Done (Session 8)
+- [x] ~~Historical + Forecast Climate Data~~ — ✅ Done (Session 8)
+- [x] ~~Satellite LST with NASA GIBS~~ — ✅ Done (Session 8)
 - [ ] Timeline Slider (City Rewind) — scrub through 24h historical data
 - [ ] What-If Scenario Builder — drag to close roads, draw solar zones, predict impact
 - [ ] Real Bordeaux Open Data — connect to `opendata.bordeaux-metropole.fr`
 - [ ] Full SUMO TraCI Agent Simulation — individual vehicle behavior modeling
 - [ ] Energy Grid Flow Animation — animated current from substations to neighborhoods
-- [ ] Climate Risk / Urban Heat Island — 3D temperature overlay, flood zone integration
 - [ ] Digital Twin API — REST endpoints for city planners and GIS tools
 
 ---

@@ -11,7 +11,7 @@ import { useSimulationStore } from './store/simulationStore'
 import { useScenarioStore } from './store/scenarioStore'
 
 // ── Glass style constants ─────────────────────────────────────────────────────
-const GLASS = 'bg-gray-900/40 backdrop-blur-xl border-white/10'
+const GLASS = 'bg-gray-900/28 backdrop-blur-2xl border-white/8'
 
 function Header() {
   const { kpis, isConnected, lastUpdate } = useSimulationStore()
@@ -128,7 +128,7 @@ function RightSidebar({ open, onToggle }: { open: boolean; onToggle: () => void 
       </button>
 
       {open ? (
-        <div className="flex-1 overflow-y-auto p-4 scrollbar-thin">
+        <div className="flex-1 overflow-y-auto p-4 scrollbar-thin scrollbar-thumb-gray-600 scrollbar-track-transparent">
           <RightPanel />
         </div>
       ) : (

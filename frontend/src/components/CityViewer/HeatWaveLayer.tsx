@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useLayerStore } from '../../store/layerStore'
+import { useRiskStore } from '../../store/riskStore'
 
 const API = 'http://localhost:8000/api'
 
@@ -168,29 +169,81 @@ function tempToColor(t: number): [number, number, number, number] {
   return               [124, 58,  237, 0.95]
 }
 
-function buildHeatGrid(area: AreaData): { lon: number; lat: number; temp: number }[] {
-  const poly  = AREA_POLYGONS[area.name]
-  if (!poly) return []
-  const lons  = poly.map(p => p[0]), lats = poly.map(p => p[1])
-  const spots = HEAT_SPOTS[area.name] ?? []
-  const STEP  = 0.0018
-  const pts: { lon: number; lat: number; temp: number }[] = []
-  for (let lon = Math.min(...lons) + STEP/2; lon < Math.max(...lons); lon += STEP)
-    for (let lat = Math.min(...lats) + STEP/2; lat < Math.max(...lats); lat += STEP)
-      pts.push({ lon, lat, temp: area.temp_c + posNoise(lon, lat) + spots.reduce((a,s) => a + spotInfluence(lon,lat,s), 0) })
-  return pts
+
+interface WindData  { speed: number; dir: number }
+interface HoverInfo { x: number; y: number; temp: number; risk: string; areaName: string }
+
+function diurnalOffset(targetHour: number): number {
+  // Diurnal swing ±5°C relative to current measurement time; peak at 14:00, trough at 02:00
+  const now  = 5 * Math.cos((new Date().getHours() - 14) * Math.PI / 12)
+  const tgt  = 5 * Math.cos((targetHour           - 14) * Math.PI / 12)
+  return +(tgt - now).toFixed(1)
+}
+
+function windDirName(deg: number): string {
+  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(deg / 45) % 8]
+}
+
+function SaveScenarioButton({ area, sliders, predictedTemp, onSave }: {
+  area: string
+  sliders: { tree_cover_pct: number; water_ha: number; green_roof_pct: number; cool_roof_pct: number }
+  predictedTemp: number
+  onSave: (s: any) => void
+}) {
+  const [naming, setNaming] = useState(false)
+  const [name, setName] = useState('')
+  const [saved, setSaved] = useState(false)
+
+  const handleSave = () => {
+    if (!name.trim()) return
+    onSave({ name: name.trim(), area, sliders, predictedTemp, savedAt: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) })
+    setSaved(true); setNaming(false); setName('')
+    setTimeout(() => setSaved(false), 2000)
+  }
+
+  if (saved) return <div className="mt-2 text-center text-[9px] text-green-400">✓ Saved to Scenarios panel</div>
+
+  return (
+    <div className="mt-2">
+      {!naming ? (
+        <button
+          onClick={() => setNaming(true)}
+          className="w-full text-[9px] py-1 rounded-lg border border-dashed border-blue-500/30 text-blue-400 hover:bg-blue-900/20 transition-all"
+        >
+          💾 Save as Scenario
+        </button>
+      ) : (
+        <div className="flex gap-1">
+          <input
+            autoFocus
+            value={name}
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleSave(); if (e.key === 'Escape') setNaming(false) }}
+            placeholder="Scenario name…"
+            className="flex-1 bg-gray-800 border border-white/15 text-white text-[10px] px-2 py-1 rounded-lg focus:outline-none focus:border-blue-500/50 placeholder-gray-600"
+          />
+          <button onClick={handleSave} className="text-[10px] px-2 py-1 rounded-lg bg-blue-600/40 border border-blue-500/40 text-blue-300 hover:bg-blue-600/60 transition-all">✓</button>
+          <button onClick={() => setNaming(false)} className="text-[10px] px-2 py-1 rounded-lg border border-white/10 text-gray-600 hover:text-white transition-all">✕</button>
+        </div>
+      )}
+    </div>
+  )
 }
 
 export function HeatWaveLayer({ viewer }: { viewer: any }) {
-  const { showHeatWave } = useLayerStore()
+  const { showHeatWave, opacities, focusArea, globalTimeHour, saveScenario } = useLayerStore()
+  const { setHeat } = useRiskStore()
 
-  const canvasRef    = useRef<HTMLCanvasElement | null>(null)
-  const rafRef       = useRef<number>(0)
-  const selectedRef  = useRef<AreaData | null>(null)
-  const polyEntRef   = useRef<any[]>([])
-  const labelEntRef  = useRef<any[]>([])
-  const heatPrimRef  = useRef<any>(null)
-  const intervalRef  = useRef<any>(null)
+  const canvasRef           = useRef<HTMLCanvasElement | null>(null)
+  const rafRef              = useRef<number>(0)
+  const selectedRef         = useRef<AreaData | null>(null)
+  const areasRef            = useRef<AreaData[]>([])
+  const windRef             = useRef<WindData>({ speed: 12, dir: 220 })
+  const timeHourRef         = useRef<number>(new Date().getHours())
+  const projectedSpotsRef   = useRef<{ x: number; y: number; temp: number; pxRad: number; areaName: string }[]>([])
+  const polyEntRef          = useRef<any[]>([])
+  const labelEntRef         = useRef<any[]>([])
+  const intervalRef         = useRef<any>(null)
 
   const [areas, setAreas]           = useState<AreaData[]>([])
   const [selected, setSelected]     = useState<AreaData | null>(null)
@@ -198,21 +251,104 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
   const [simSliders, setSimSliders] = useState({ tree_cover_pct: 0, water_ha: 0, green_roof_pct: 0, cool_roof_pct: 0 })
   const [simResult, setSimResult]   = useState<SimResult | null>(null)
   const [lastUpdate, setLastUpdate] = useState('')
+  const [wind, setWind]   = useState<WindData>({ speed: 12, dir: 220 })
+  const [hover, setHover] = useState<HoverInfo | null>(null)
 
-  // Keep ref in sync for RAF access
+  // Keep refs in sync for RAF access
   useEffect(() => { selectedRef.current = selected }, [selected])
+  useEffect(() => { windRef.current = wind }, [wind])
+  useEffect(() => { timeHourRef.current = globalTimeHour }, [globalTimeHour])
+
+  // Adjusted areas: base temps shifted by diurnal offset for selected hour
+  const adjustedAreas = useMemo(() =>
+    areas.map(a => ({ ...a, temp_c: +(a.temp_c + diurnalOffset(globalTimeHour)).toFixed(1) }))
+  , [areas, globalTimeHour])
+  useEffect(() => { areasRef.current = adjustedAreas }, [adjustedAreas])
+
+  // Sync selected area data when temps change (diurnal slider)
+  useEffect(() => {
+    setSelected(prev => {
+      if (!prev) return null
+      return adjustedAreas.find(a => a.name === prev.name) ?? prev
+    })
+  }, [adjustedAreas])
+
+  // Focus area from left panel — auto-select across layers
+  useEffect(() => {
+    if (!focusArea) { setSelected(null); return }
+    const found = adjustedAreas.find(a => a.name === focusArea)
+    if (found) { setSelected(found); setSimMode(false); setSimSliders({ tree_cover_pct: 0, water_ha: 0, green_roof_pct: 0, cool_roof_pct: 0 }) }
+  }, [focusArea])  // intentionally omit adjustedAreas — focusArea change is the trigger
+
+  // Publish highest heat risk to city risk store
+  useEffect(() => {
+    if (!areas.length) return
+    const worst = areas.reduce((mx, a) => (a.temp_c > mx.temp_c ? a : mx), areas[0])
+    setHeat(worst.risk as any, `${worst.name} ${worst.temp_c}°C`)
+  }, [areas, setHeat])
 
   // ── Fetch areas ─────────────────────────────────────────────────────────────
   const fetchAreas = useCallback(async () => {
-    try {
-      const r = await fetch(`${API}/climate/heatwave`, { signal: AbortSignal.timeout(5000) })
-      if (!r.ok) throw new Error()
-      const d = await r.json()
+    // UHI deltas per area (matches backend climate_service.py AREAS config)
+    const UHI: Record<string, number> = {
+      'Bordeaux City': 4.0, 'Mérignac': 3.0, 'Pessac': 1.5, 'Talence': 1.0, 'Gradignan': 0.0,
+    }
+
+    const [climateRes, weatherRes] = await Promise.allSettled([
+      fetch(`${API}/climate/heatwave`, { signal: AbortSignal.timeout(5000) }),
+      fetch(
+        'https://api.open-meteo.com/v1/forecast' +
+        '?latitude=44.8378&longitude=-0.5792' +
+        '&current=temperature_2m,relative_humidity_2m,windspeed_10m,winddirection_10m' +
+        '&timezone=Europe%2FParis',
+        { signal: AbortSignal.timeout(8000) }
+      ),
+    ])
+
+    // ── 1. Backend is up → use its response ───────────────────────────────
+    if (climateRes.status === 'fulfilled' && climateRes.value.ok) {
+      const d = await climateRes.value.json()
       setAreas(d.areas?.length ? d.areas : FALLBACK_AREAS)
       setLastUpdate(new Date().toLocaleTimeString('fr-FR') + ' 🟢')
-    } catch {
+
+    // ── 2. Backend offline but Open-Meteo responded → compute live temps ──
+    } else if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
+      const w = await weatherRes.value.json()
+      const baseTemp: number = w.current?.temperature_2m ?? 28
+      const humidity: number = w.current?.relative_humidity_2m ?? 55
+
+      // Heat Index (Steadman) for feels_like
+      const feelsLike = (temp: number) => {
+        if (temp < 27) return temp
+        const T = temp * 9/5 + 32, R = humidity
+        const hi = -42.379 + 2.049*T + 10.143*R - 0.225*T*R - 0.00684*T*T
+                 - 0.0548*R*R + 0.00123*T*T*R + 0.000853*T*R*R - 0.00000199*T*T*R*R
+        return +((hi - 32) * 5/9).toFixed(1)
+      }
+      const risk = (t: number) =>
+        t < 36 ? 'Normal' : t < 39 ? 'Caution' : t < 42 ? 'Danger' : t < 46 ? 'Extreme' : 'Emergency'
+      const color = (t: number) =>
+        t < 35 ? '#3b82f6' : t < 38 ? '#f59e0b' : t < 41 ? '#f97316' : t < 44 ? '#ef4444' : '#7c3aed'
+
+      const liveAreas = FALLBACK_AREAS.map(a => {
+        const temp = +(baseTemp + (UHI[a.name] ?? 0)).toFixed(1)
+        return { ...a, temp_c: temp, feels_like_c: feelsLike(temp),
+          humidity_pct: humidity, risk: risk(temp), color: color(temp),
+          source: 'Open-Meteo (direct)' }
+      })
+      setAreas(liveAreas)
+      setLastUpdate(new Date().toLocaleTimeString('fr-FR') + ' 🟡 live')
+
+    // ── 3. Both failed → static fallback ──────────────────────────────────
+    } else {
       setAreas(FALLBACK_AREAS)
       setLastUpdate(new Date().toLocaleTimeString('fr-FR') + ' ⚫ offline')
+    }
+
+    // Wind from Open-Meteo regardless of backend status
+    if (weatherRes.status === 'fulfilled' && weatherRes.value.ok) {
+      const w = await weatherRes.value.json()
+      setWind({ speed: w.current?.windspeed_10m ?? 12, dir: w.current?.winddirection_10m ?? 220 })
     }
   }, [])
 
@@ -223,13 +359,9 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
     return () => clearInterval(intervalRef.current)
   }, [showHeatWave, fetchAreas])
 
-  // ── Canvas heat animation — ONLY on selected area ───────────────────────────
+  // ── Canvas heat animation ────────────────────────────────────────────────────
   useEffect(() => {
-    if (!viewer || !showHeatWave) {
-      cancelAnimationFrame(rafRef.current)
-      return
-    }
-
+    if (!viewer || !showHeatWave) { cancelAnimationFrame(rafRef.current); return }
     const Cesium = (window as any).Cesium
 
     const draw = () => {
@@ -237,7 +369,6 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
       const sel    = selectedRef.current
       if (!canvas) { rafRef.current = requestAnimationFrame(draw); return }
 
-      // Sync canvas pixel size to container
       const parent = canvas.parentElement
       if (parent) {
         if (canvas.width  !== parent.clientWidth)  canvas.width  = parent.clientWidth
@@ -246,118 +377,197 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
 
       const ctx = canvas.getContext('2d')!
       ctx.clearRect(0, 0, canvas.width, canvas.height)
+      const t = performance.now() / 1000
+      const w = canvas.width, h = canvas.height
+      const allAreas = areasRef.current
 
-      // No area selected → clear (street dots still visible)
+      // ── 1. Expanding risk rings — Extreme / Emergency (drawn first) ──────────
+      const RING_RGB: Record<string, string> = { Extreme: '239,68,68', Emergency: '124,58,237' }
+      allAreas.forEach(area => {
+        if (!RING_RGB[area.risk]) return
+        let ap: { x: number; y: number } | null = null
+        try { ap = viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(area.lon, area.lat, 30)) }
+        catch { return }
+        if (!ap) return
+        const rgb = RING_RGB[area.risk]
+        for (let ri = 0; ri < 3; ri++) {
+          const phase = ((t * 0.45 + ri * 0.333) % 1)
+          ctx.beginPath()
+          ctx.arc(ap.x, ap.y, 55 + phase * 175, 0, Math.PI * 2)
+          ctx.strokeStyle = `rgba(${rgb},${((1 - phase) * 0.5).toFixed(3)})`
+          ctx.lineWidth = 2.5 * (1 - phase * 0.8)
+          ctx.stroke()
+        }
+      })
+
+      // ── 2. Gaussian heatmap — screen blending for realistic heat glow ────────
+      type ScreenSpot = { x: number; y: number; temp: number; pxRad: number; areaName: string }
+      const screenSpots: ScreenSpot[] = []
+
+      allAreas.forEach(area => {
+        const spots = HEAT_SPOTS[area.name] ?? []
+        let cp: { x: number; y: number } | null = null
+        try { cp = viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(area.lon, area.lat, 30)) }
+        catch {}
+        if (cp && cp.x > -300 && cp.x < w + 300 && cp.y > -300 && cp.y < h + 300)
+          screenSpots.push({ x: cp.x, y: cp.y, temp: area.temp_c, pxRad: 160, areaName: area.name })
+
+        spots.forEach(s => {
+          let sp: { x: number; y: number } | null = null
+          try { sp = viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(s.lon, s.lat, 30)) }
+          catch { return }
+          if (!sp || sp.x < -200 || sp.x > w + 200 || sp.y < -200 || sp.y > h + 200) return
+          screenSpots.push({ x: sp.x, y: sp.y, temp: area.temp_c + s.delta, pxRad: Math.abs(s.delta) * 14 + 55, areaName: area.name })
+        })
+      })
+
+      projectedSpotsRef.current = screenSpots
+
+      ctx.globalCompositeOperation = 'screen'
+      ;[...screenSpots].sort((a, b) => a.temp - b.temp).forEach(spot => {
+        const pulse  = 1 + 0.1 * Math.sin(t * 1.5 + spot.x * 0.031 + spot.y * 0.021)
+        const r_px   = spot.pxRad * pulse
+        const [r, g, b] = tempToColor(spot.temp)
+        const isCenter  = spot.pxRad === 160
+        const peakA     = isCenter ? 0.20 : Math.min(0.48, 0.28 + Math.abs(spot.temp - 40) * 0.05)
+        const grad = ctx.createRadialGradient(spot.x, spot.y, 0, spot.x, spot.y, r_px)
+        grad.addColorStop(0,    `rgba(${r},${g},${b},${peakA.toFixed(3)})`)
+        grad.addColorStop(0.45, `rgba(${r},${g},${b},${(peakA * 0.4).toFixed(3)})`)
+        grad.addColorStop(1,    `rgba(${r},${g},${b},0)`)
+        ctx.fillStyle = grad
+        ctx.fillRect(0, 0, w, h)
+      })
+      ctx.globalCompositeOperation = 'source-over'
+
+      // ── 3. Wind arrows at area centers ──────────────────────────────────────
+      const { speed: wSpeed, dir: wDir } = windRef.current
+      if (wSpeed > 0.5 && allAreas.length > 0) {
+        const toRad = ((wDir + 180) % 360) * Math.PI / 180
+        const sinD = Math.sin(toRad), cosD = -Math.cos(toRad)
+        allAreas.forEach(area => {
+          let ap: { x: number; y: number } | null = null
+          try { ap = viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(area.lon, area.lat, 80)) }
+          catch { return }
+          if (!ap) return
+          const arrowLen = Math.min(55, wSpeed * 3.5)
+          // Animated flowing dots along wind direction
+          for (let i = 0; i < 4; i++) {
+            const phase = ((t * 0.7 + i * 0.25) % 1)
+            ctx.beginPath()
+            ctx.arc(ap.x + sinD * arrowLen * phase, ap.y + cosD * arrowLen * phase, 2.5, 0, Math.PI * 2)
+            ctx.fillStyle = `rgba(147,197,253,${(0.75 * (1 - phase)).toFixed(2)})`
+            ctx.fill()
+          }
+          // Arrowhead at tip
+          if (arrowLen > 8) {
+            const ex = ap.x + sinD * arrowLen, ey = ap.y + cosD * arrowLen
+            const hl = Math.min(10, arrowLen * 0.28)
+            const px = cosD * hl * 0.5, py = -sinD * hl * 0.5
+            ctx.beginPath()
+            ctx.moveTo(ex, ey)
+            ctx.lineTo(ex - sinD * hl + px, ey - cosD * hl + py)
+            ctx.lineTo(ex - sinD * hl - px, ey - cosD * hl - py)
+            ctx.closePath()
+            ctx.fillStyle = 'rgba(147,197,253,0.75)'
+            ctx.fill()
+          }
+        })
+      }
+
+      // ── 4. Selected-area detailed clipped animation ──────────────────────────
       if (!sel) { rafRef.current = requestAnimationFrame(draw); return }
-
       const poly = AREA_POLYGONS[sel.name]
       if (!poly) { rafRef.current = requestAnimationFrame(draw); return }
 
-      // Project area polygon corners to screen pixels
       const pts = poly.map(([lon, lat]) => {
         try { return viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(lon, lat, 30)) }
         catch { return null }
       }).filter(Boolean) as { x: number; y: number }[]
-
       if (pts.length < 3) { rafRef.current = requestAnimationFrame(draw); return }
 
-      const t = performance.now() / 1000
-      const w = canvas.width, h = canvas.height
       const [br, bg, bb] = hexToRgb(sel.color)
-
       ctx.save()
-
-      // ── Clip to projected area polygon ──────────────────────────────────────
       ctx.beginPath()
       ctx.moveTo(pts[0].x, pts[0].y)
       pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y))
       ctx.closePath()
       ctx.clip()
 
-      // ── 1. Base semi-transparent heat fill ──────────────────────────────────
       ctx.fillStyle = `rgba(${br},${bg},${bb},0.14)`
       ctx.fillRect(0, 0, w, h)
 
-      // ── 2. Animated rising heat bands (vertical shimmer) ────────────────────
       const bandH = h * 0.18
       const scroll = (t * 28) % (bandH * 2)
       for (let by = -bandH * 2 + scroll; by < h + bandH; by += bandH * 2) {
         const bAlpha = 0.07 + Math.sin(t * 0.9 + by * 0.005) * 0.025
         const bGrad = ctx.createLinearGradient(0, by, 0, by + bandH)
-        bGrad.addColorStop(0,   `rgba(255,160,20,0)`)
+        bGrad.addColorStop(0,   'rgba(255,160,20,0)')
         bGrad.addColorStop(0.5, `rgba(255,160,20,${bAlpha.toFixed(3)})`)
-        bGrad.addColorStop(1,   `rgba(255,160,20,0)`)
+        bGrad.addColorStop(1,   'rgba(255,160,20,0)')
         ctx.fillStyle = bGrad
         ctx.fillRect(0, by, w, bandH)
       }
 
-      // ── 3. Hot/cool spot radial gradients at real geographic positions ──────
       const spots = HEAT_SPOTS[sel.name] ?? []
       spots.forEach(spot => {
         let sp: { x: number; y: number } | null = null
         try { sp = viewer.scene.cartesianToCanvasCoordinates(Cesium.Cartesian3.fromDegrees(spot.lon, spot.lat, 30)) }
         catch { return }
         if (!sp) return
-
-        const pulse  = 1 + Math.sin(t * 1.3 + spot.lon * 7) * 0.13
-        const pxRad  = (Math.abs(spot.delta) * 32 + 85) * pulse
-        const grad   = ctx.createRadialGradient(sp.x, sp.y, 0, sp.x, sp.y, pxRad)
-
-        if (spot.delta >= 3.5) {         // extreme hot (airport tarmac, dense city)
-          grad.addColorStop(0,   `rgba(124,58,237,0.75)`)  // purple core
-          grad.addColorStop(0.25,`rgba(239,68,68, 0.60)`)  // red
-          grad.addColorStop(0.6, `rgba(249,115,22,0.30)`)  // orange fade
-          grad.addColorStop(1,   `rgba(249,115,22,0)`)
-        } else if (spot.delta >= 2) {    // hot
-          grad.addColorStop(0,   `rgba(239,68,68, 0.65)`)
-          grad.addColorStop(0.4, `rgba(249,115,22,0.40)`)
-          grad.addColorStop(0.8, `rgba(250,204,21,0.15)`)
-          grad.addColorStop(1,   `rgba(250,204,21,0)`)
-        } else if (spot.delta > 0) {     // warm
-          grad.addColorStop(0,   `rgba(249,115,22,0.50)`)
-          grad.addColorStop(0.5, `rgba(250,204,21,0.25)`)
-          grad.addColorStop(1,   `rgba(250,204,21,0)`)
-        } else if (spot.delta <= -3) {   // very cool (forest, river, water)
-          grad.addColorStop(0,   `rgba(34,211,238,0.70)`)  // cyan core
-          grad.addColorStop(0.35,`rgba(74,222,128,0.45)`)  // green
-          grad.addColorStop(0.7, `rgba(74,222,128,0.18)`)
-          grad.addColorStop(1,   `rgba(74,222,128,0)`)
-        } else {                         // cool (park, garden)
-          grad.addColorStop(0,   `rgba(74,222,128,0.55)`)
-          grad.addColorStop(0.5, `rgba(34,211,238,0.25)`)
-          grad.addColorStop(1,   `rgba(34,211,238,0)`)
+        const pulse = 1 + Math.sin(t * 1.3 + spot.lon * 7) * 0.13
+        const pxRad = (Math.abs(spot.delta) * 32 + 85) * pulse
+        const grad  = ctx.createRadialGradient(sp.x, sp.y, 0, sp.x, sp.y, pxRad)
+        if (spot.delta >= 3.5) {
+          grad.addColorStop(0,    'rgba(124,58,237,0.75)')
+          grad.addColorStop(0.25, 'rgba(239,68,68,0.60)')
+          grad.addColorStop(0.6,  'rgba(249,115,22,0.30)')
+          grad.addColorStop(1,    'rgba(249,115,22,0)')
+        } else if (spot.delta >= 2) {
+          grad.addColorStop(0,   'rgba(239,68,68,0.65)')
+          grad.addColorStop(0.4, 'rgba(249,115,22,0.40)')
+          grad.addColorStop(0.8, 'rgba(250,204,21,0.15)')
+          grad.addColorStop(1,   'rgba(250,204,21,0)')
+        } else if (spot.delta > 0) {
+          grad.addColorStop(0,   'rgba(249,115,22,0.50)')
+          grad.addColorStop(0.5, 'rgba(250,204,21,0.25)')
+          grad.addColorStop(1,   'rgba(250,204,21,0)')
+        } else if (spot.delta <= -3) {
+          grad.addColorStop(0,    'rgba(34,211,238,0.70)')
+          grad.addColorStop(0.35, 'rgba(74,222,128,0.45)')
+          grad.addColorStop(0.7,  'rgba(74,222,128,0.18)')
+          grad.addColorStop(1,    'rgba(74,222,128,0)')
+        } else {
+          grad.addColorStop(0,   'rgba(74,222,128,0.55)')
+          grad.addColorStop(0.5, 'rgba(34,211,238,0.25)')
+          grad.addColorStop(1,   'rgba(34,211,238,0)')
         }
-
         ctx.fillStyle = grad
         ctx.fillRect(0, 0, w, h)
       })
 
-      // ── 4. Animated pulsing wave overlay ────────────────────────────────────
       const waveAlpha = 0.04 + Math.sin(t * 0.7) * 0.02
       const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length
       const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length
-      const maxR = Math.max(...pts.map(p => Math.hypot(p.x - cx, p.y - cy))) * 1.2
+      const maxR  = Math.max(...pts.map(p => Math.hypot(p.x - cx, p.y - cy))) * 1.2
       const wGrad = ctx.createRadialGradient(cx, cy, maxR * 0.2, cx, cy, maxR)
       wGrad.addColorStop(0,   `rgba(${br},${bg},${bb},0)`)
       wGrad.addColorStop(0.6, `rgba(${br},${bg},${bb},${waveAlpha.toFixed(3)})`)
       wGrad.addColorStop(1,   `rgba(${br},${bg},${bb},${(waveAlpha * 1.5).toFixed(3)})`)
       ctx.fillStyle = wGrad
       ctx.fillRect(0, 0, w, h)
-
       ctx.restore()
 
-      // ── 5. Glowing pulsing border (outside clip) ────────────────────────────
-      const glow  = 0.55 + Math.sin(t * 1.8) * 0.25
-      const gHex  = Math.round(glow * 255).toString(16).padStart(2,'0')
+      const glow = 0.55 + Math.sin(t * 1.8) * 0.25
+      const gHex = Math.round(glow * 255).toString(16).padStart(2, '0')
       ctx.save()
       ctx.beginPath()
       ctx.moveTo(pts[0].x, pts[0].y)
       pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y))
       ctx.closePath()
-      ctx.shadowColor  = sel.color
-      ctx.shadowBlur   = 18
-      ctx.strokeStyle  = `${sel.color}${gHex}`
-      ctx.lineWidth    = 3
+      ctx.shadowColor = sel.color
+      ctx.shadowBlur  = 18
+      ctx.strokeStyle = `${sel.color}${gHex}`
+      ctx.lineWidth   = 3
       ctx.stroke()
       ctx.restore()
 
@@ -378,9 +588,9 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
     polyEntRef.current  = []
     labelEntRef.current = []
 
-    if (!showHeatWave || !areas.length) return
+    if (!showHeatWave || !adjustedAreas.length) return
 
-    areas.forEach(area => {
+    adjustedAreas.forEach(area => {
       const poly = AREA_POLYGONS[area.name]
       if (!poly) return
       const positions = poly.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat))
@@ -413,26 +623,36 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
         },
       }))
     })
-  }, [viewer, showHeatWave, areas])
+  }, [viewer, showHeatWave, adjustedAreas])
 
-  // ── Street-level heat dot grid ───────────────────────────────────────────────
+  // ── Hover temperature probe ──────────────────────────────────────────────────
   useEffect(() => {
-    if (!viewer) return
-    const Cesium = (window as any).Cesium
-
-    if (heatPrimRef.current) { viewer.scene.primitives.remove(heatPrimRef.current); heatPrimRef.current = null }
-    if (!showHeatWave || !areas.length) return
-
-    const col = new Cesium.PointPrimitiveCollection()
-    areas.forEach(area => {
-      buildHeatGrid(area).forEach(({ lon, lat, temp }) => {
-        const [r, g, b, a] = tempToColor(temp)
-        col.add({ position: Cesium.Cartesian3.fromDegrees(lon, lat, 5), color: new Cesium.Color(r/255, g/255, b/255, a), pixelSize: 10 })
+    if (!viewer || !showHeatWave) { setHover(null); return }
+    const container = viewer.container as HTMLElement
+    const onMove = (e: MouseEvent) => {
+      const rect = container.getBoundingClientRect()
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top
+      const spots = projectedSpotsRef.current
+      if (!spots.length) { setHover(null); return }
+      let tempSum = 0, weightSum = 0, nearestArea = '', nearestD = Infinity
+      spots.forEach(s => {
+        const dx = mx - s.x, dy = my - s.y
+        const sigma = s.pxRad * 0.5
+        const w = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))
+        tempSum += s.temp * w
+        weightSum += w
+        const d2 = dx * dx + dy * dy
+        if (d2 < nearestD) { nearestD = d2; nearestArea = s.areaName }
       })
-    })
-    viewer.scene.primitives.add(col)
-    heatPrimRef.current = col
-  }, [viewer, showHeatWave, areas])
+      if (weightSum < 0.002) { setHover(null); return }
+      const temp = +(tempSum / weightSum).toFixed(1)
+      setHover({ x: mx, y: my, temp, risk: getRisk(temp), areaName: nearestArea })
+    }
+    const onLeave = () => setHover(null)
+    container.addEventListener('mousemove', onMove)
+    container.addEventListener('mouseleave', onLeave)
+    return () => { container.removeEventListener('mousemove', onMove); container.removeEventListener('mouseleave', onLeave) }
+  }, [viewer, showHeatWave])
 
   // ── Full cleanup on layer off ────────────────────────────────────────────────
   useEffect(() => {
@@ -441,7 +661,6 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
       polyEntRef.current.forEach(e => viewer.entities.remove(e))
       labelEntRef.current.forEach(e => viewer.entities.remove(e))
       polyEntRef.current = []; labelEntRef.current = []
-      if (heatPrimRef.current) { viewer.scene.primitives.remove(heatPrimRef.current); heatPrimRef.current = null }
     }
   }, [showHeatWave, viewer])
 
@@ -467,19 +686,39 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
 
   return (
     <>
-      {/* ── Full-screen canvas (area-clipped heat animation) ── */}
+      {/* ── Full-screen canvas ── */}
       <canvas
         ref={canvasRef}
         className="absolute inset-0 w-full h-full pointer-events-none"
-        style={{ zIndex: 10 }}
+        style={{ zIndex: 10, opacity: opacities.showHeatWave / 100 }}
       />
+
+      {/* ── Hover temperature tooltip ── */}
+      {hover && (
+        <div
+          className="absolute z-30 pointer-events-none"
+          style={{ left: hover.x + 14, top: hover.y - 20 }}
+        >
+          <div className="bg-gray-950/95 backdrop-blur-sm border border-white/15 rounded-xl px-3 py-2 shadow-2xl">
+            <div className="text-[9px] text-gray-500 mb-0.5">{hover.areaName}</div>
+            <div className="text-base font-black leading-none" style={{ color: RISK_COLORS[hover.risk] }}>
+              {hover.temp}°C
+            </div>
+            <div className="text-[9px] font-bold mt-0.5" style={{ color: RISK_COLORS[hover.risk] }}>
+              {hover.risk}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Bottom area cards ── */}
       {!selected && (
         <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2">
-          <div className="text-[10px] text-gray-500 text-center">Click an area to see heat wave</div>
+          <div className="text-[10px] text-gray-500 text-center">Click area · hover map to probe · use panel for timeline</div>
+
+          {/* Area cards — show adjusted temps */}
           <div className="flex gap-2">
-            {areas.map(a => (
+            {adjustedAreas.map(a => (
               <button key={a.name}
                 onClick={() => { setSelected(a); setSimMode(false); setSimSliders({ tree_cover_pct: 0, water_ha: 0, green_roof_pct: 0, cool_roof_pct: 0 }) }}
                 className="flex flex-col items-center gap-0.5 px-3 py-2 rounded-xl border backdrop-blur-lg transition-all hover:scale-105 active:scale-95"
@@ -491,14 +730,20 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
               </button>
             ))}
           </div>
-          {/* Color legend */}
-          <div className="flex items-center gap-1.5 bg-gray-950/85 backdrop-blur px-3 py-1.5 rounded-xl border border-white/10">
+
+          {/* Color legend + wind + last update */}
+          <div className="flex items-center gap-1.5 bg-gray-950/85 backdrop-blur px-3 py-1.5 rounded-xl border border-white/10 flex-wrap justify-center">
             {([['#22d3ee','<38°C'],['#4ade80','39°C'],['#facc15','41°C'],['#f97316','42°C'],['#ef4444','44°C'],['#7c3aed','45+°C']] as const).map(([c,l]) => (
               <div key={l} className="flex items-center gap-1">
                 <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: c }} />
                 <span className="text-[9px] text-gray-500">{l}</span>
               </div>
             ))}
+            {wind.speed > 0.5 && (
+              <span className="text-[9px] text-blue-400 ml-1 border-l border-white/10 pl-1.5">
+                💨 {wind.speed.toFixed(0)} km/h {windDirName(wind.dir)}
+              </span>
+            )}
             {lastUpdate && <span className="text-[9px] text-gray-600 ml-1">🌡 {lastUpdate}</span>}
           </div>
         </div>
@@ -620,6 +865,12 @@ export function HeatWaveLayer({ viewer }: { viewer: any }) {
                       </div>
                     )}
                     <div className="text-[8px] text-gray-700 mt-2">{simResult.model}</div>
+                    <SaveScenarioButton
+                      area={selected.name}
+                      sliders={simSliders}
+                      predictedTemp={simResult.predicted_temp_c}
+                      onSave={saveScenario}
+                    />
                   </div>
                 ) : (
                   <div className="text-center text-[10px] text-gray-600 py-3 border border-dashed border-white/10 rounded-xl">

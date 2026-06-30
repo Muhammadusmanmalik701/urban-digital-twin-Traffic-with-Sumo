@@ -756,4 +756,221 @@ af40141 feat: area-specific rain simulation + SUMO ego_car fix
 
 ---
 
-*Last updated: June 24 2026 | Author: UrbanTwin Dev*
+## 🌡️ Session 8 — Street Heat Thermal Network + Satellite LST + UI Overhaul (June 30 2026)
+
+### Goals
+- Georeferenced street-level heat map (not screen overlay — proper world-space)
+- Real historical + forecast temperature data from authenticated open sources
+- Anomaly detection vs previous year
+- All layer-specific controls moved to Right Panel (no more floating overlays)
+- Area filtering: layer data shows only for selected communes
+- Default "Bordeaux City" selected on startup
+- Reduced panel opacity so 3D map shows through
+
+---
+
+### 1. Street Thermal Network (`StreetHeatLayer.tsx`)
+
+**Why GroundPolylinePrimitive instead of canvas:**
+Canvas overlays are screen-space (fixed to pixels, not geographic coordinates). When the camera moves, the heatmap stays glued to the screen instead of following the map. `GroundPolylinePrimitive` is world-space — it drapes onto terrain and moves correctly with the 3D globe.
+
+**Architecture:**
+```
+Open-Meteo API (20-point grid, live) → IDW interpolation → per-road temperature
+OSM GeoJSON (5 area files, ~44K roads) → RENDER_HW filter → ~10-12K roads
+Temperature → RdYlBu colormap → ColorGeometryInstanceAttribute
+One GroundPolylinePrimitive (all roads in single GPU call)
+Stats + historical + forecast → streetHeatStore (read by RightPanel)
+```
+
+**Temperature formula per road segment (Falda et al. 2025 methodology):**
+```
+T_road = IDW(air_temp) + road_delta × ToD_factor + UHI_zone - park_cooling + seeded_noise
+```
+- `road_delta`: motorway +8.2°C → residential +3.0°C (paper Table values)
+- `ToD_factor`: `max(0.12, 0.55 + 0.45 × cos((h-14) × 2π/24))` — peaks 14:00, troughs ~02:00
+- `UHI_zone`: Bordeaux City +4°C, Mérignac +3°C, Pessac +1.5°C, Talence +1.0°C, Gradignan 0°C
+- `park_cooling`: Parc Bordelais −2.8°C, Jardin Public −2.2°C, etc. (NDVI proxy)
+- `seeded_noise`: `sin(lon×127.1 + lat×311.7) × 43758.5453` → ±0.6°C stable per-road variation
+
+**RdYlBu colormap:** 22°C (deep blue) → 37°C (yellow) → 56°C (dark red) — same scale as QGIS/Landsat LST maps in paper.
+
+**Area filtering:**
+```typescript
+const AREA_MAP: Record<string, string> = {
+  'Bordeaux City': 'bordeaux-city',
+  'Mérignac':      'merignac',
+  // ...
+}
+// Only load files for selectedAreas from mapControlStore
+const keys = selectedAreas.map(a => AREA_MAP[a]).filter(Boolean)
+```
+
+**Module-level cache:** `_areaCache: Record<string, ParsedRoad[]>` — each area's GeoJSON parsed once per browser session. `Promise.all` loads all selected areas in parallel.
+
+---
+
+### 2. OSM Road GeoJSON Download (`scripts/download_roads.py`)
+
+Downloaded real OpenStreetMap road network for 5 Bordeaux communes via Overpass API:
+
+| Area | File | Roads |
+|------|------|-------|
+| Bordeaux City | `bordeaux-city.geojson` (4.7 MB) | 18,628 |
+| Mérignac | `merignac.geojson` (2.6 MB) | 9,585 |
+| Pessac | `pessac.geojson` (2.2 MB) | 8,490 |
+| Talence | `talence.geojson` (961 KB) | 3,776 |
+| Gradignan | `gradignan.geojson` (964 KB) | 3,654 |
+| **Total** | | **44,133 roads** |
+
+**Script features:**
+- 3 Overpass mirrors (tries next on HTTP 429 rate limit)
+- Re-run safe (skips existing files >10 KB)
+- 3s polite pause between requests
+- UTF-8 forced stdout (fixes Windows cp1252 encoding errors)
+- Only stores needed tags: `highway`, `name`, `maxspeed`, `lanes`, `railway`, `surface`, `lit`
+
+**RENDER_HW filter:** Only renders motorway/trunk/primary/secondary/tertiary/residential — reduces 44K to ~10-12K roads, keeps GPU build time under 4 seconds.
+
+---
+
+### 3. Historical Data + Forecast + Anomaly
+
+**API: Open-Meteo Archive** (`archive-api.open-meteo.com/v1/archive`):
+- ERA5 reanalysis, hourly from 1940-present, free, no auth
+- Fetches 30 days of daily `temperature_2m_max/min/mean` for Bordeaux center (44.84°N, -0.58°E)
+- Also fetches same 30-day window for **previous year** (for anomaly calculation)
+
+**API: Open-Meteo Forecast** (`api.open-meteo.com/v1/forecast`):
+- 7-day ahead daily forecast: max/min temp + WMO weather code
+
+**Anomaly calculation:**
+```typescript
+const recentMean = means.slice(-7).reduce((a,b)=>a+b,0) / 7  // this week
+const lyMean     = lyMeans.slice(-7).reduce((a,b)=>a+b,0) / 7  // same week last year
+setAnomaly(+(recentMean - lyMean).toFixed(1))  // e.g. +2.3°C or -1.1°C
+```
+
+All three fetches (`historical`, `lastYear`, `forecast`) are fired in parallel with `Promise.all`.
+
+---
+
+### 4. Satellite LST Layer (`SatelliteLSTLayer.tsx`)
+
+**Modes:** LST (surface temp) / NDVI (vegetation index) / NDBI (built-up index)
+
+**Data:** Open-Meteo batch API, 20-point 5×4 grid (44.67–44.91°N, -0.77–-0.44°E)
+- `surface_temperature` (if available) or `temperature_2m` + UHI correction
+
+**Canvas rendering:** Gaussian-weighted interpolation (σ=120px) from 20 grid points onto every 4th pixel — matches paper's spatial continuity.
+
+**NASA GIBS overlay:** `WebMapServiceImageryProvider` on Cesium globe:
+- LST mode: `MODIS_Terra_Land_Surface_Temp_Day` (daily, 1 km)
+- NDVI mode: `MODIS_Terra_Vegetation_Indices_NDVI_Monthly`
+- Toggle ON/OFF — may have cloud gaps
+
+**Interventions (Falda et al. 2025):**
+- Green roofs: −0.7°C applied to surface_temperature before canvas render
+- Cool asphalt: −1.9°C applied to surface_temperature
+
+---
+
+### 5. Store Architecture Refactor
+
+**New stores:**
+
+`streetHeatStore.ts` — written by StreetHeatLayer, read by RightPanel:
+```typescript
+{ status, updatedAt, progress, stats, historical, forecast, anomaly }
+```
+
+`satelliteLSTStore.ts` — written by RightPanel (user controls), read by SatelliteLSTLayer:
+```typescript
+{ mode, opacity, greenRoofs, coolAsphalt, gibs, fetchTime, loading, stats }
+```
+
+**Why separate stores instead of component props:**
+StreetHeatLayer and SatelliteLSTLayer are mounted in CesiumViewer (deep in DOM). RightPanel is a sibling in App. Passing data up+down through props would require drilling through 3 layers. Zustand stores let both components communicate directly without prop drilling.
+
+---
+
+### 6. RightPanel — Complete Rewrite
+
+Old RightPanel: area checkboxes + road type filter + building inspector.
+
+New RightPanel: all active layer properties, collapsible sections:
+
+```
+┌─────────────────────────────┐
+│ 📍 Select Areas             │  (always visible, compact)
+├─────────────────────────────┤
+│ 🌡️ Street Heat   [LIVE]    │  (only when showStreetHeat ON)
+│   MIN/MEAN/MAX chips        │
+│   RdYlBu legend             │
+│   🔥 +2.3°C vs last year   │  ← anomaly badge
+│   30-day SVG sparkline      │
+│   7-day forecast tiles      │
+├─────────────────────────────┤
+│ 🛰️ Satellite LST           │  (only when showSatelliteLST ON)
+│   [LST] [NDVI] [NDBI]      │
+│   Opacity slider            │
+│   Interventions             │
+│   NASA GIBS toggle          │
+├─────────────────────────────┤
+│ 🏢 Building Inspector       │  (only when building clicked)
+└─────────────────────────────┘
+```
+
+**SVG sparkline component:**
+- Path through 30 daily mean temperatures
+- Shaded range area (min to max) under line
+- Orange dot at most recent point
+- Drawn with raw SVG — no chart library dependency
+
+---
+
+### 7. UI / Layout Improvements
+
+- **Panel opacity:** `bg-gray-900/40` → `bg-gray-900/28` with `backdrop-blur-2xl` — map much more visible through glass
+- **LayerTogglePanel:** removed redundant "Focus Area" dropdown (area control now centralized in RightPanel)
+- **Default area:** `selectedAreas: ['Bordeaux City']` was already the default in `mapControlStore.ts` ✓
+- **Collapsible sections in RightPanel:** each section has open/close toggle (▲/▼), opens by default
+
+### TypeScript + Build
+```
+npx tsc --noEmit → 0 errors
+npm run build → ✓ built in 9.51s (328 KB JS gzip: 99 KB)
+```
+
+### New Files
+```
+frontend/src/store/streetHeatStore.ts      ← shared street heat state
+frontend/src/store/satelliteLSTStore.ts    ← shared satellite LST controls
+frontend/src/components/CityViewer/StreetHeatLayer.tsx   ← full rewrite
+frontend/src/components/CityViewer/SatelliteLSTLayer.tsx ← removed floating panel
+frontend/public/data/roads/bordeaux-city.geojson (4.7 MB)
+frontend/public/data/roads/merignac.geojson    (2.6 MB)
+frontend/public/data/roads/pessac.geojson      (2.2 MB)
+frontend/public/data/roads/talence.geojson     (961 KB)
+frontend/public/data/roads/gradignan.geojson   (964 KB)
+scripts/download_roads.py
+```
+
+### Modified Files
+```
+frontend/src/components/MapControls/RightPanel.tsx   ← full rewrite
+frontend/src/components/UI/LayerTogglePanel.tsx      ← removed Focus Area dropdown
+frontend/src/store/layerStore.ts                     ← showSatelliteLST + showStreetHeat
+frontend/src/App.tsx                                 ← opacity reduced
+```
+
+### Key Library/API References
+- **Open-Meteo Forecast:** `api.open-meteo.com/v1/forecast` — free, no auth, batch lat/lon support
+- **Open-Meteo Archive:** `archive-api.open-meteo.com/v1/archive` — ERA5, free, no auth
+- **NASA GIBS:** `gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi` — free, no auth
+- **Overpass API:** `overpass-api.de/api/interpreter` — free (polite use)
+- **Falda et al. 2025:** Sustainability 17(24):10906 — Thessaloniki LST, methodology applied to Bordeaux
+
+---
+
+*Last updated: June 30 2026 | Author: UrbanTwin Dev*

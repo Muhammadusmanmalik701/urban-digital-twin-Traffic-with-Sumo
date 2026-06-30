@@ -42,6 +42,11 @@ import { useLayerStore } from '../../store/layerStore'
 import { useMapControlStore } from '../../store/mapControlStore'
 import { api } from '../../services/api'
 import { HeatWaveLayer } from './HeatWaveLayer'
+import { FloodSimLayer } from './FloodSimLayer'
+import { BuildingInspector } from './BuildingInspector'
+import { HeatShimmerLayer } from './HeatShimmerLayer'
+import { SatelliteLSTLayer } from './SatelliteLSTLayer'
+import { StreetHeatLayer } from './StreetHeatLayer'
 
 const RAIN_AREA_BBOXES: Record<string, [number, number, number, number]> = {
   'Pessac':        [-0.636, 44.796, -0.596, 44.818],
@@ -2028,6 +2033,21 @@ export function CesiumViewer() {
 
       {/* ── Heat Wave Layer ── */}
       {viewerReady && <HeatWaveLayer viewer={cesiumViewer.current} />}
+
+      {/* ── Street-level heat shimmer (PostProcessStage shader) ── */}
+      {viewerReady && <HeatShimmerLayer viewer={cesiumViewer.current} />}
+
+      {/* ── Flood Simulation Layer ── */}
+      {viewerReady && <FloodSimLayer viewer={cesiumViewer.current} />}
+
+      {/* ── Building Click Inspector ── */}
+      {viewerReady && <BuildingInspector viewer={cesiumViewer.current} />}
+
+      {/* ── Satellite LST (NASA GIBS overlay) ── */}
+      {viewerReady && <SatelliteLSTLayer viewer={cesiumViewer.current} />}
+
+      {/* ── Street Heat Network (georeferenced road-level thermal) ── */}
+      {viewerReady && <StreetHeatLayer viewer={cesiumViewer.current} />}
 
       {/* ── SUMO launch button (top-right of map) ── */}
       {!sim.loaded && liveState === 'idle' && (
